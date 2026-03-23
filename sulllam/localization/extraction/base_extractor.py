@@ -1,7 +1,7 @@
+from __future__ import annotations
+
 import torch
 import numpy as np
-
-from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
@@ -16,8 +16,8 @@ class BaseExtractor(ABC):
         return self._name
 
     def extract(self, image: np.ndarray | torch.tensor) -> list[str]:
-        raw_keys = self._extract(image)
-        return self._normalize_keys(raw_keys)
+        keypoints, descriptors = self._extract(image)
+        return keypoints, descriptors
 
     @abstractmethod
     def _extract(self, image: np.ndarray | torch.tensor) -> Iterable[str]:
