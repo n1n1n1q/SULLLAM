@@ -35,10 +35,13 @@ class EightPointPoseEstimator(BaseEstimator):
 
         points, R, t, mask_pose = cv.recoverPose(E, keypoints_query, keypoints_train, self.config.K)
 
+        # points = points[mask_pose]
+
         return {
             "success": True,
             "R": R,
             "t": t,
-            "points": points
+            "points": points,
+            "inliers_mask": mask
         }
 
