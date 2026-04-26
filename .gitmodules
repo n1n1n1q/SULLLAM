@@ -1,0 +1,3 @@
+[submodule "submodules/theseus"]
+	path = submodules/theseus
+	url = https://github.com/facebookresearch/theseus.git
