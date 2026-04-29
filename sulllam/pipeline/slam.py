@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import time
 from pathlib import Path
 
 import cv2 as cv
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from sulllam.localization.extraction.superpoint import SuperPointFeatureExtractor
+from sulllam.localization.matching.lightglue import LightGlueMatcher
 from sulllam.mapping.map import Keyframe, Mapper
+from sulllam.mapping.pose_graph import PoseGraph
 from sulllam.pipeline.config import SLAMConfig
 from sulllam.pipeline.triangulator import Triangulator
 
@@ -29,11 +31,13 @@ class SLAMPipeline:
             max_depth=config.max_depth,
             max_points=config.max_points,
         )
+        self.pose_graph = PoseGraph()
 
         self._R_global = np.eye(3)
         self._t_global = np.zeros(3)
         self._prev_keypoints = None
         self._prev_descriptors = None
+        self._prev_feats: dict | None = None
         self._frame_idx = 0
         self.trajectory: list[np.ndarray] = []
 
@@ -43,6 +47,9 @@ class SLAMPipeline:
         kps, descs = self.config.extractor.extract(image)
         self._prev_keypoints = kps
         self._prev_descriptors = descs
+
+        if isinstance(self.config.extractor, SuperPointFeatureExtractor):
+            self._prev_feats = self.config.extractor.extract_tensors(image)
 
         initial_kf = Keyframe(
             idx=0,
@@ -59,10 +66,34 @@ class SLAMPipeline:
         i = self._frame_idx
 
         curr_kps, curr_descs = cfg.extractor.extract(image)
-        matches = cfg.matcher.match(self._prev_descriptors, curr_descs)
+        curr_feats: dict | None = None
+        if isinstance(cfg.extractor, SuperPointFeatureExtractor):
+            curr_feats = cfg.extractor.extract_tensors(image)
 
-        prev_pts = np.array([self._prev_keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-        curr_pts = np.array([curr_kps[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        if (
+            isinstance(cfg.matcher, LightGlueMatcher)
+            and curr_feats is not None
+            and self._prev_feats is not None
+        ):
+            matches = cfg.matcher.match_tensors(self._prev_feats, curr_feats)
+        else:
+            matches = cfg.matcher.match(self._prev_descriptors, curr_descs)
+
+        if len(matches) < 8:
+            print(f"[SLAM] Frame {i}: too few matches ({len(matches)}), skipping")
+            self._prev_keypoints = curr_kps
+            self._prev_descriptors = curr_descs
+            self._prev_feats = curr_feats
+            self._frame_idx += 1
+            return {"matches": matches, "prev_keypoints": self._prev_keypoints,
+                    "curr_keypoints": curr_kps, "image": image}
+
+        prev_pts = np.array(
+            [self._prev_keypoints[m.queryIdx].pt for m in matches]
+        ).reshape(-1, 1, 2)
+        curr_pts = np.array(
+            [curr_kps[m.trainIdx].pt for m in matches]
+        ).reshape(-1, 1, 2)
 
         estimate = cfg.pose_estimator.estimate(prev_pts, curr_pts)
         R, t = estimate["R"], estimate["t"].reshape(-1)
@@ -79,7 +110,11 @@ class SLAMPipeline:
         )
         self.mapper.add_keyframe(curr_kf)
 
-        # Triangulate
+        prev_kf = self.mapper.previous_keyframe
+        if prev_kf is not None:
+            rel_pose = _Rt_to_T(R, t)
+            self.pose_graph.add_odometry_edge(prev_kf.idx, curr_kf.idx, rel_pose)
+
         inliers = inliers_mask.ravel() == 1
         prev_inliers = prev_pts[inliers].reshape(-1, 2)
         curr_inliers = curr_pts[inliers].reshape(-1, 2)
@@ -97,18 +132,35 @@ class SLAMPipeline:
 
         for cand in candidates:
             pt_id = self.mapper.pointmap.add_point(cand["pt3d"], color=cand["color"])
-            self.mapper.pointmap.add_observation(pt_id, self.mapper.previous_keyframe.idx, cand["uv_prev"])
-            self.mapper.pointmap.add_observation(pt_id, self.mapper.current_keyframe.idx, cand["uv_curr"])
+            self.mapper.pointmap.add_observation(
+                pt_id, self.mapper.previous_keyframe.idx, cand["uv_prev"]
+            )
+            self.mapper.pointmap.add_observation(
+                pt_id, self.mapper.current_keyframe.idx, cand["uv_curr"]
+            )
 
-        # Bundle adjustment
         if i % cfg.ba_frequency == 0 and i >= cfg.ba_min_frames:
             cfg.bundle_adjustment.run(self.mapper, cfg.K)
-            self._R_global = self.mapper.current_keyframe.R.copy()
-            self._t_global = self.mapper.current_keyframe.t.copy()
 
-        # Update accumulators from (possibly LBA-corrected) keyframe
-        self._R_global = self.mapper.current_keyframe.R
-        self._t_global = self.mapper.current_keyframe.t
+        loop_closed = False
+        if i % cfg.lc_frequency == 0:
+            lc_candidates = cfg.loop_closure_detector.detect(curr_kf, self.mapper, cfg.K)
+            for lc in lc_candidates:
+                self.pose_graph.add_loop_closure_edge(
+                    from_id=lc["match_kf"].idx,
+                    to_id=lc["query_kf"].idx,
+                    relative_pose=lc["relative_pose"],
+                )
+                loop_closed = True
+
+        if loop_closed:
+            cfg.pose_graph_optimizer.optimize(self.mapper, self.pose_graph)
+
+        if loop_closed and i >= cfg.gba_min_frames:
+            cfg.global_bundle_adjustment.run(self.mapper, cfg.K)
+
+        self._R_global = self.mapper.current_keyframe.R.copy()
+        self._t_global = self.mapper.current_keyframe.t.copy()
 
         camera_pos = -self._R_global.T @ self._t_global
         self.trajectory.append(camera_pos)
@@ -117,6 +169,7 @@ class SLAMPipeline:
 
         self._prev_keypoints = curr_kps
         self._prev_descriptors = curr_descs
+        self._prev_feats = curr_feats
         self._frame_idx += 1
 
         return {
@@ -130,7 +183,6 @@ class SLAMPipeline:
         self._initialize(images[0])
 
         for i, image in enumerate(images[1:], start=1):
-            time.sleep(1)
             frame_info = self._process_frame(image)
 
             if ros_publisher is not None:
@@ -153,11 +205,16 @@ class SLAMPipeline:
         image = frame_info["image"]
         matches = frame_info["matches"]
         curr_kps = frame_info["curr_keypoints"]
-        prev_kps = frame_info["prev_keypoints"]
 
-        # prev_image is images[i-1], but we stored prev_kps from the previous iteration already
         pair = cv.hconcat([prev_image, image])
-        match_img = cv.drawMatches(prev_image, self.mapper.keyframes[-2].keypoints, image, curr_kps, matches, None)
+        match_img = cv.drawMatches(
+            prev_image,
+            self.mapper.keyframes[-2].keypoints,
+            image,
+            curr_kps,
+            matches,
+            None,
+        )
 
         ros_publisher.publish_trajectory(translations, orientations)
         ros_publisher.publish_current_pair(pair)

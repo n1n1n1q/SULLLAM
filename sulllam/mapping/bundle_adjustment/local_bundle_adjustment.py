@@ -11,7 +11,7 @@ from sulllam.mapping.bundle_adjustment.base_bundle_adjustment import BaseBundleA
 
 @dataclass
 class LocalBundleAdjustmentConfig:
-    window_size: int = 5
+    window_size: int = 20
     huber_radius: float = 2.0
     max_iterations: int = 10
     abs_err_tolerance: float = 1e-4

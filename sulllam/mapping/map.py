@@ -81,3 +81,4 @@ class Mapper:
     @property
     def previous_keyframe(self) -> Keyframe | None:
         return self.keyframes[-2] if len(self.keyframes) > 1 else None
+

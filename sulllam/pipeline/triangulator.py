@@ -21,7 +21,6 @@ class Triangulator:
         pts2: np.ndarray,
         image_rgb: np.ndarray,
     ) -> list[dict]:
-        """Triangulate points and return filtered candidates sorted by reprojection error."""
         K = self.K
         P1 = K @ np.hstack((R_prev, t_prev.reshape(3, 1)))
         P2 = K @ np.hstack((R_curr, t_curr.reshape(3, 1)))
