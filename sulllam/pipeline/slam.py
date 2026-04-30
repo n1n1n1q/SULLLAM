@@ -40,6 +40,7 @@ class SLAMPipeline:
         self._prev_feats: dict | None = None
         self._current_match_scores: np.ndarray = np.array([])
         self._frame_idx = 0
+        self._last_pgo_kf: int = -10**9
         self.trajectory: list[np.ndarray] = []
 
         config.clouds_dir.mkdir(parents=True, exist_ok=True)
@@ -155,10 +156,17 @@ class SLAMPipeline:
                 )
                 loop_closed = True
 
-        if loop_closed:
-            cfg.pose_graph_optimizer.optimize(self.mapper, self.pose_graph)
+        # Throttle PGO/GBA: even if the LC detector keeps firing on the same
+        # revisit, don't re-run PGO unless enough new keyframes have been added
+        # since the last optimisation. Avoids pummelling the map with back-to-
+        # back PGO+GBA on overlapping detections.
+        run_pgo = loop_closed and (i - self._last_pgo_kf) >= cfg.lc_frequency
 
-        if loop_closed and i >= cfg.gba_min_frames:
+        if run_pgo:
+            cfg.pose_graph_optimizer.optimize(self.mapper, self.pose_graph)
+            self._last_pgo_kf = i
+
+        if run_pgo and i >= cfg.gba_min_frames:
             cfg.global_bundle_adjustment.run(self.mapper, cfg.K)
 
         self._R_global = self.mapper.current_keyframe.R.copy()

@@ -11,10 +11,14 @@ from sulllam.mapping.map import Keyframe, Mapper
 @dataclass
 class LoopClosureConfig:
     min_matches: int = 30
-    min_frame_gap: int = 20
+    min_frame_gap: int = 30
     ransac_reproj_threshold: float = 3.0
     ransac_confidence: float = 0.995
-    min_inlier_ratio: float = 0.3
+    min_inlier_ratio: float = 0.5
+    # Cap how many loop-closure edges may be returned per detector call. Keeps
+    # PGO from being swamped by dozens of near-duplicate "loops" produced by a
+    # forward-moving camera with overlapping textures.
+    max_candidates: int = 1
 
 
 class LoopClosureDetector:
@@ -86,17 +90,29 @@ class LoopClosureDetector:
 
             _, R, t, _ = cv.recoverPose(E, query_pts, train_pts, K, mask=mask)
 
-            relative_pose = np.eye(4)
-            relative_pose[:3, :3] = R
-            relative_pose[:3, 3] = t.flatten()
+            T_match_query = np.eye(4)
+            T_match_query[:3, :3] = R
+            T_match_query[:3, 3] = t.flatten()
+            relative_pose = np.linalg.inv(T_match_query)
 
             candidates.append({
                 "query_kf": current_kf,
                 "match_kf": kf,
                 "relative_pose": relative_pose,
                 "num_inliers": num_inliers,
+                "inlier_ratio": inlier_ratio,
             })
-            print(f"[LC] Loop closure: kf {current_kf.idx} ↔ kf {kf.idx}  "
-                  f"({num_inliers} inliers, ratio {inlier_ratio:.2f})")
+
+        # Keep only the strongest candidates (by inlier count). For monocular
+        # SLAM with continuous motion, almost every nearby keyframe will pass
+        # the geometric check; returning all of them creates hundreds of fake
+        # loop-closure edges that drown out the odometry chain in PGO.
+        candidates.sort(key=lambda c: c["num_inliers"], reverse=True)
+        if cfg.max_candidates > 0:
+            candidates = candidates[: cfg.max_candidates]
+
+        for c in candidates:
+            print(f"[LC] Loop closure: kf {c['query_kf'].idx} ↔ kf {c['match_kf'].idx}  "
+                  f"({c['num_inliers']} inliers, ratio {c['inlier_ratio']:.2f})")
 
         return candidates

@@ -73,6 +73,27 @@ def _pose_graph_error_fixed_to(optim_vars, aux_vars):
     return predicted.log_map()
 
 
+def _pose_graph_rot_error(optim_vars, aux_vars):
+    pose_from, pose_to = optim_vars
+    (rel_pose,) = aux_vars
+    predicted = pose_to.inverse().compose(rel_pose).compose(pose_from)
+    return predicted.log_map()[..., 3:]
+
+
+def _pose_graph_rot_error_fixed_from(optim_vars, aux_vars):
+    (pose_to,) = optim_vars
+    pose_from, rel_pose = aux_vars
+    predicted = pose_to.inverse().compose(rel_pose).compose(pose_from)
+    return predicted.log_map()[..., 3:]
+
+
+def _pose_graph_rot_error_fixed_to(optim_vars, aux_vars):
+    (pose_from,) = optim_vars
+    pose_to, rel_pose = aux_vars
+    predicted = pose_to.inverse().compose(rel_pose).compose(pose_from)
+    return predicted.log_map()[..., 3:]
+
+
 @dataclass
 class PoseGraphOptimizerConfig:
     max_iterations: int = 20
@@ -119,7 +140,6 @@ class PoseGraphOptimizer:
         print(f"[PG] Anchored keyframe: {anchor_id}")
 
         objective = th.Objective(dtype=torch.float64)
-        weight = th.ScaleCostWeight(torch.tensor(1.0, dtype=torch.float64))
 
         for i, edge in enumerate(pose_graph.edges):
             if edge.from_id not in se3_vars or edge.to_id not in se3_vars:
@@ -131,16 +151,36 @@ class PoseGraphOptimizer:
             pose_from = se3_vars[edge.from_id]
             pose_to = se3_vars[edge.to_id]
 
-            info_scalar = float(np.trace(edge.information) / 6.0)
+            # Loop closures from monocular essential-matrix decomposition have
+            # unit-norm translation (scale ambiguity), so we constrain rotation
+            # only. Odometry edges keep the full 6-DoF residual.
+            if edge.is_loop_closure:
+                err_dim = 3
+                err_full = _pose_graph_rot_error
+                err_fixed_from = _pose_graph_rot_error_fixed_from
+                err_fixed_to = _pose_graph_rot_error_fixed_to
+                # Use the rotation block of the information matrix.
+                info_block = edge.information[3:, 3:]
+                info_mean = float(np.trace(info_block) / 3.0)
+            else:
+                err_dim = 6
+                err_full = _pose_graph_error
+                err_fixed_from = _pose_graph_error_fixed_from
+                err_fixed_to = _pose_graph_error_fixed_to
+                info_mean = float(np.trace(edge.information) / 6.0)
+
+            # ScaleCostWeight multiplies the residual, so the squared cost is
+            # multiplied by scale**2. For a Mahalanobis cost r^T (lambda*I) r
+            # the matching scalar weight is sqrt(lambda).
             edge_weight = th.ScaleCostWeight(
-                torch.tensor(info_scalar, dtype=torch.float64)
+                torch.tensor(np.sqrt(max(info_mean, 0.0)), dtype=torch.float64)
             )
 
             if edge.from_id == anchor_id:
                 cost = th.AutoDiffCostFunction(
                     optim_vars=[pose_to],
-                    err_fn=_pose_graph_error_fixed_from,
-                    dim=6,
+                    err_fn=err_fixed_from,
+                    dim=err_dim,
                     aux_vars=[pose_from, rel_var],
                     cost_weight=edge_weight,
                     name=f"pg_edge_{i}",
@@ -148,8 +188,8 @@ class PoseGraphOptimizer:
             elif edge.to_id == anchor_id:
                 cost = th.AutoDiffCostFunction(
                     optim_vars=[pose_from],
-                    err_fn=_pose_graph_error_fixed_to,
-                    dim=6,
+                    err_fn=err_fixed_to,
+                    dim=err_dim,
                     aux_vars=[pose_to, rel_var],
                     cost_weight=edge_weight,
                     name=f"pg_edge_{i}",
@@ -157,8 +197,8 @@ class PoseGraphOptimizer:
             else:
                 cost = th.AutoDiffCostFunction(
                     optim_vars=[pose_from, pose_to],
-                    err_fn=_pose_graph_error,
-                    dim=6,
+                    err_fn=err_full,
+                    dim=err_dim,
                     aux_vars=[rel_var],
                     cost_weight=edge_weight,
                     name=f"pg_edge_{i}",
@@ -190,6 +230,10 @@ class PoseGraphOptimizer:
         print(f"[PG] Iterations  : {info.converged_iter[0].item() + 1}")
         print(f"[PG] Final error : {final_error:.4f}  (delta {initial_error - final_error:.4f})")
 
+        # Per-keyframe correction transform that takes a world point seen by
+        # the OLD pose to its consistent location under the NEW pose:
+        #     p_new = R_corr @ p_old + t_corr
+        # with R_corr = R_wc_new^T @ R_wc_old and t_corr = R_wc_new^T @ (t_wc_old - t_wc_new).
         pose_corrections: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
@@ -202,30 +246,29 @@ class PoseGraphOptimizer:
 
             R_old, t_old = old_pose[:3, :3], old_pose[:3, 3]
             R_new, t_new = new_pose[:3, :3], new_pose[:3, 3]
-            R_wc_new = R_new.T
-            t_wc_new = -R_new.T @ t_new
-            R_corr = R_wc_new @ R_old
-            t_corr = R_wc_new @ t_old + t_wc_new
+            R_cw_new = R_new.T
+            t_cw_new = -R_new.T @ t_new
+            R_corr = R_cw_new @ R_old
+            t_corr = R_cw_new @ t_old + t_cw_new
             pose_corrections[kf_id] = (R_corr, t_corr)
 
-        corrected_points: set[int] = set()
-        pt_correction_sum: dict[int, tuple[np.ndarray, np.ndarray, int]] = {}
-
-        for kf_id, (R_corr, t_corr) in pose_corrections.items():
+        # Anchor each 3D point to a SINGLE keyframe (its earliest observer that
+        # has a correction). Element-wise averaging of rotation matrices across
+        # multiple observing keyframes does not produce a rotation, so it
+        # contracts/skews the point cloud — which then blows up the next BA.
+        sorted_kf_ids = sorted(pose_corrections.keys())
+        pt_anchor: dict[int, int] = {}
+        for kf_id in sorted_kf_ids:
             obs_ids = mapper.pointmap._kf_to_obs.get(kf_id, [])
             for obs_id in obs_ids:
                 pt_id = int(mapper.pointmap.observations[obs_id, 0])
-                if pt_id not in pt_correction_sum:
-                    pt_correction_sum[pt_id] = (np.zeros((3, 3)), np.zeros(3), 0)
-                R_acc, t_acc, count = pt_correction_sum[pt_id]
-                pt_correction_sum[pt_id] = (R_acc + R_corr, t_acc + t_corr, count + 1)
+                if pt_id not in pt_anchor:
+                    pt_anchor[pt_id] = kf_id
 
-        for pt_id, (R_sum, t_sum, count) in pt_correction_sum.items():
-            R_avg = R_sum / count
-            t_avg = t_sum / count
+        for pt_id, kf_id in pt_anchor.items():
+            R_corr, t_corr = pose_corrections[kf_id]
             p = mapper.pointmap.points_3d[pt_id]
-            mapper.pointmap.points_3d[pt_id] = R_avg @ p + t_avg
-            corrected_points.add(pt_id)
+            mapper.pointmap.points_3d[pt_id] = R_corr @ p + t_corr
 
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
@@ -236,5 +279,6 @@ class PoseGraphOptimizer:
             new_pose[:3, :] = new_3x4
             kf.pose = new_pose
 
-        print(f"[PG] Corrected {len(corrected_points)} 3D points (averaged across {len(pose_corrections)} keyframes)")
+        print(f"[PG] Corrected {len(pt_anchor)} 3D points "
+              f"(single anchor per point, {len(pose_corrections)} keyframes updated)")
         print(f"[PG] --- Pose Graph Optimization Complete ---\n")
