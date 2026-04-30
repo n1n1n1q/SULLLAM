@@ -48,6 +48,11 @@ class MinimalSLAMPipeline:
         ba_frequency: int = 5,
         ba_min_frames: int = 12,
         clouds_dir: Path = Path("clouds"),
+        use_match_confidence: bool = False,
+        confidence_gamma: float = 1.0,
+        use_adaptive_barron: bool = False,
+        barron_alpha_min: float = -2.0,
+        barron_alpha_max: float = 2.0,
     ):
         self.K = K
         self.max_reproj_error = max_reproj_error
@@ -62,7 +67,15 @@ class MinimalSLAMPipeline:
         self.pose_estimator = EightPointPoseEstimator(
             config=EightPointEstimatorConfig(K=K)
         )
-        self.bundle_adjustment = LocalBundleAdjustment(LocalBundleAdjustmentConfig())
+        self.bundle_adjustment = LocalBundleAdjustment(
+            LocalBundleAdjustmentConfig(
+                use_match_confidence=use_match_confidence,
+                confidence_gamma=confidence_gamma,
+                use_adaptive_barron=use_adaptive_barron,
+                barron_alpha_min=barron_alpha_min,
+                barron_alpha_max=barron_alpha_max,
+            )
+        )
         self.triangulator = Triangulator(
             K=K,
             max_reproj_error=max_reproj_error,
@@ -108,9 +121,9 @@ class MinimalSLAMPipeline:
         curr_feats = self.extractor.extract_tensors(image)
 
         if curr_feats is not None and self._prev_feats is not None:
-            matches = self.matcher.match_tensors(self._prev_feats, curr_feats)
+            matches, match_scores = self.matcher.match_tensors(self._prev_feats, curr_feats)
         else:
-            matches = self.matcher.match(self._prev_descriptors, curr_descs)
+            matches, match_scores = self.matcher.match(self._prev_descriptors, curr_descs)
 
         if len(matches) < 8:
             print(f"[SLAM] Frame {i}: too few matches ({len(matches)}), skipping")
@@ -144,6 +157,7 @@ class MinimalSLAMPipeline:
             keypoints=curr_kps,
             descriptors=curr_descs,
             pose=_Rt_to_T(self._R_global, self._t_global),
+            match_scores=match_scores,
         )
         self.mapper.add_keyframe(curr_kf)
 
@@ -287,6 +301,21 @@ def main() -> None:
         "--ba_min_frames", type=int, default=12, help="Minimum frames before running local BA"
     )
     parser.add_argument(
+        "--use-match-confidence", action="store_true", help="Enable confidence-weighted residuals (Sprint A)"
+    )
+    parser.add_argument(
+        "--confidence-gamma", type=float, default=1.0, help="Match confidence exponent (default 1.0)"
+    )
+    parser.add_argument(
+        "--use-adaptive-barron", action="store_true", help="Enable adaptive Barron loss from entropy (Sprint B)"
+    )
+    parser.add_argument(
+        "--barron-alpha-min", type=float, default=-2.0, help="Min Barron alpha (dark scenes)"
+    )
+    parser.add_argument(
+        "--barron-alpha-max", type=float, default=2.0, help="Max Barron alpha (bright scenes)"
+    )
+    parser.add_argument(
         "--no-ros", action="store_true", help="Run without ROS publishing"
     )
     args = parser.parse_args()
@@ -332,6 +361,11 @@ def main() -> None:
         ba_frequency=args.ba_frequency,
         ba_min_frames=args.ba_min_frames,
         clouds_dir=args.output,
+        use_match_confidence=args.use_match_confidence,
+        confidence_gamma=args.confidence_gamma,
+        use_adaptive_barron=args.use_adaptive_barron,
+        barron_alpha_min=args.barron_alpha_min,
+        barron_alpha_max=args.barron_alpha_max,
     )
 
     try:

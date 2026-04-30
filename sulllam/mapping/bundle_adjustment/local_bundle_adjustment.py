@@ -5,8 +5,10 @@ from dataclasses import dataclass, field
 import numpy as np
 import torch
 import theseus as th
+import cv2
 
 from sulllam.mapping.bundle_adjustment.base_bundle_adjustment import BaseBundleAdjustment
+from sulllam.preprocessing.entropy import image_entropy, map_entropy_to_alpha
 
 
 @dataclass
@@ -16,6 +18,11 @@ class LocalBundleAdjustmentConfig:
     max_iterations: int = 10
     abs_err_tolerance: float = 1e-4
     rel_err_tolerance: float = 1e-4
+    use_match_confidence: bool = False
+    confidence_gamma: float = 1.0
+    use_adaptive_barron: bool = False
+    barron_alpha_min: float = -2.0
+    barron_alpha_max: float = 2.0
 
 
 def _reproj_error_opt_cam(optim_vars, aux_vars):
@@ -83,6 +90,29 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
 
         print(f"[BA] {len(local_point_ids)} points, {len(ba_obs)} observations")
 
+        kf_scores = {}
+        if cfg.use_match_confidence:
+            for kf in local_kfs:
+                if kf.match_scores is not None and len(kf.match_scores) > 0:
+                    kf_scores[kf.idx] = kf.match_scores
+            if kf_scores:
+                print(f"[BA] Using match confidence weights from {len(kf_scores)} keyframes")
+
+        kf_entropies = {}
+        alpha_global = 0.0
+        if cfg.use_adaptive_barron:
+            for kf in local_kfs:
+                if hasattr(kf, 'image') and kf.image is not None:
+                    gray = cv2.cvtColor(kf.image, cv2.COLOR_BGR2GRAY) if len(kf.image.shape) == 3 else kf.image
+                    ent = image_entropy(gray)
+                    kf_entropies[kf.idx] = ent
+                else:
+                    kf_entropies[kf.idx] = 4.0
+            if kf_entropies:
+                mean_entropy = np.mean(list(kf_entropies.values()))
+                alpha_global = map_entropy_to_alpha(mean_entropy, cfg.barron_alpha_min, cfg.barron_alpha_max)
+                print(f"[BA] Adaptive Barron: entropy {mean_entropy:.3f} → alpha {alpha_global:.3f}")
+
         K_tensor = torch.tensor([[K[0, 0], K[1, 1], K[0, 2], K[1, 2]]], dtype=torch.float64)
         K_var = th.Vector(tensor=K_tensor, name="K_shared")
 
@@ -115,13 +145,22 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
             cam_var = se3_vars[kf_id]
             pt_var = pt_vars[pt_id]
 
+            weight_scalar = 1.0
+            if cfg.use_match_confidence and kf_id in kf_scores:
+                scores = kf_scores[kf_id]
+                if len(scores) > 0:
+                    avg_score = float(np.mean(scores))
+                    weight_scalar = avg_score ** cfg.confidence_gamma
+
+            edge_weight = th.ScaleCostWeight(torch.tensor(weight_scalar, dtype=torch.float64))
+
             if kf_id == fixed_kf_id:
                 cost_fn = th.AutoDiffCostFunction(
                     optim_vars=[pt_var],
                     err_fn=_reproj_error_fixed_cam,
                     dim=2,
                     aux_vars=[cam_var, K_var, uv_var],
-                    cost_weight=weight,
+                    cost_weight=edge_weight,
                     name=f"cost_{pt_id}_{kf_id}",
                 )
                 fixed_edges += 1
@@ -131,7 +170,7 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
                     err_fn=_reproj_error_opt_cam,
                     dim=2,
                     aux_vars=[K_var, uv_var],
-                    cost_weight=weight,
+                    cost_weight=edge_weight,
                     name=f"cost_{pt_id}_{kf_id}",
                 )
                 opt_edges += 1

@@ -51,11 +51,12 @@ class PointMap:
 
 
 class Keyframe:
-    def __init__(self, idx: int, keypoints, descriptors, pose: np.ndarray):
+    def __init__(self, idx: int, keypoints, descriptors, pose: np.ndarray, match_scores: np.ndarray = None):
         self.idx = idx
         self.keypoints = keypoints
         self.descriptors = descriptors
         self.pose = pose
+        self.match_scores = match_scores if match_scores is not None else np.array([])
 
     @property
     def R(self) -> np.ndarray:

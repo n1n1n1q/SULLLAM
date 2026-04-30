@@ -48,9 +48,9 @@ class LightGlueMatcher(BaseMatcher):
 
     def _match(self, query_descriptors, train_descriptors):
         if query_descriptors is None or train_descriptors is None:
-            return []
+            return [], np.array([])
         if len(query_descriptors) == 0 or len(train_descriptors) == 0:
-            return []
+            return [], np.array([])
 
         n0, n1 = len(query_descriptors), len(train_descriptors)
         dummy_kpts0 = torch.zeros(1, n0, 2, device=self.device)
@@ -68,23 +68,23 @@ class LightGlueMatcher(BaseMatcher):
         }
         return self._run_matcher(feats0, feats1)
 
-    def match_tensors(self, feats0: dict, feats1: dict) -> list[cv.DMatch]:
+    def match_tensors(self, feats0: dict, feats1: dict) -> tuple[list[cv.DMatch], np.ndarray]:
         feats0_b = {k: v.unsqueeze(0).to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in feats0.items()}
         feats1_b = {k: v.unsqueeze(0).to(self.device) if isinstance(v, torch.Tensor) else v
                     for k, v in feats1.items()}
         return self._run_matcher(feats0_b, feats1_b)
 
-    def _run_matcher(self, feats0: dict, feats1: dict) -> list[cv.DMatch]:
+    def _run_matcher(self, feats0: dict, feats1: dict) -> tuple[list[cv.DMatch], np.ndarray]:
         with torch.no_grad():
             result = self._model({"image0": feats0, "image1": feats1})
 
         result = rbd(result)
-        matches = result["matches"]  
-        scores = result["scores"]    
+        matches = result["matches"]
+        scores = result["scores"]
 
         if matches.shape[0] == 0:
-            return []
+            return [], np.array([])
 
         matches_np = matches.cpu().numpy()
         scores_np = scores.cpu().numpy()
@@ -93,4 +93,4 @@ class LightGlueMatcher(BaseMatcher):
             cv.DMatch(int(m[0]), int(m[1]), float(1.0 - s))
             for m, s in zip(matches_np, scores_np)
         ]
-        return dm_list
+        return dm_list, scores_np

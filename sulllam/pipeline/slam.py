@@ -38,6 +38,7 @@ class SLAMPipeline:
         self._prev_keypoints = None
         self._prev_descriptors = None
         self._prev_feats: dict | None = None
+        self._current_match_scores: np.ndarray = np.array([])
         self._frame_idx = 0
         self.trajectory: list[np.ndarray] = []
 
@@ -75,9 +76,9 @@ class SLAMPipeline:
             and curr_feats is not None
             and self._prev_feats is not None
         ):
-            matches = cfg.matcher.match_tensors(self._prev_feats, curr_feats)
+            matches, self._current_match_scores = cfg.matcher.match_tensors(self._prev_feats, curr_feats)
         else:
-            matches = cfg.matcher.match(self._prev_descriptors, curr_descs)
+            matches, self._current_match_scores = cfg.matcher.match(self._prev_descriptors, curr_descs)
 
         if len(matches) < 8:
             print(f"[SLAM] Frame {i}: too few matches ({len(matches)}), skipping")
@@ -107,6 +108,7 @@ class SLAMPipeline:
             keypoints=curr_kps,
             descriptors=curr_descs,
             pose=_Rt_to_T(self._R_global, self._t_global),
+            match_scores=self._current_match_scores,
         )
         self.mapper.add_keyframe(curr_kf)
 
