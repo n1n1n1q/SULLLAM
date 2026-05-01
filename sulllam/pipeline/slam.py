@@ -30,6 +30,7 @@ class SLAMPipeline:
             max_reproj_error=config.max_reproj_error,
             max_depth=config.max_depth,
             max_points=config.max_points,
+            min_parallax_deg=config.min_paralax_deg
         )
         self.pose_graph = PoseGraph()
 
@@ -42,6 +43,12 @@ class SLAMPipeline:
         self._frame_idx = 0
         self._last_pgo_kf: int = -10**9
         self.trajectory: list[np.ndarray] = []
+
+        # Keyframe selection state
+        self._R_last_kf = np.eye(3)
+        self._t_last_kf = np.zeros(3)
+        self._last_kf_frame_idx: int = 0
+        self._last_kf_n_kps: int = 0
 
         config.clouds_dir.mkdir(parents=True, exist_ok=True)
 
@@ -63,6 +70,34 @@ class SLAMPipeline:
         self.trajectory.append(np.zeros(3))
         self._frame_idx = 1
 
+        self._R_last_kf = np.eye(3)
+        self._t_last_kf = np.zeros(3)
+        self._last_kf_frame_idx = 0
+        self._last_kf_n_kps = len(kps)
+
+    def _is_keyframe(self, n_inliers: int) -> bool:
+        cfg = self.config
+        frames_since_kf = self._frame_idx - self._last_kf_frame_idx
+
+        if frames_since_kf >= cfg.kf_max_frames:
+            return True
+
+        C_curr = -self._R_global.T @ self._t_global
+        C_kf = -self._R_last_kf.T @ self._t_last_kf
+        translation = np.linalg.norm(C_curr - C_kf)
+
+        R_rel = self._R_global @ self._R_last_kf.T
+        cos_angle = np.clip((np.trace(R_rel) - 1) / 2, -1.0, 1.0)
+        rotation_deg = np.degrees(np.arccos(cos_angle))
+
+        tracked_ratio = n_inliers / max(self._last_kf_n_kps, 1)
+
+        return (
+            translation >= cfg.kf_min_translation
+            or rotation_deg >= cfg.kf_min_rotation_deg
+            or tracked_ratio < cfg.kf_max_tracked_ratio
+        )
+
     def _process_frame(self, image: np.ndarray) -> dict:
         cfg = self.config
         i = self._frame_idx
@@ -83,9 +118,8 @@ class SLAMPipeline:
 
         if len(matches) < 8:
             print(f"[SLAM] Frame {i}: too few matches ({len(matches)}), skipping")
-            self._prev_keypoints = curr_kps
-            self._prev_descriptors = curr_descs
-            self._prev_feats = curr_feats
+            camera_pos = -self._R_global.T @ self._t_global
+            self.trajectory.append(camera_pos)
             self._frame_idx += 1
             return {"matches": matches, "prev_keypoints": self._prev_keypoints,
                     "curr_keypoints": curr_kps, "image": image}
@@ -101,8 +135,27 @@ class SLAMPipeline:
         R, t = estimate["R"], estimate["t"].reshape(-1)
         inliers_mask = estimate["inliers_mask"]
 
-        self._R_global = R @ self._R_global
-        self._t_global = R @ self._t_global + t
+        # Compose relative pose against last keyframe (not the previous frame).
+        self._R_global = R @ self._R_last_kf
+        self._t_global = R @ self._t_last_kf + t
+
+        inlier_mask = inliers_mask.ravel() == 1
+        n_inliers = int(inlier_mask.sum())
+
+        camera_pos = -self._R_global.T @ self._t_global
+        self.trajectory.append(camera_pos)
+
+        if not self._is_keyframe(n_inliers):
+            print(f"[SLAM] Frame {i}: skipped (inliers={n_inliers}, "
+                  f"frames_since_kf={i - self._last_kf_frame_idx})")
+            self._frame_idx += 1
+            return {"matches": matches, "prev_keypoints": self._prev_keypoints,
+                    "curr_keypoints": curr_kps, "image": image}
+
+        inlier_matches = [m for m, keep in zip(matches, inlier_mask) if keep]
+        prev_inliers = prev_pts[inlier_mask].reshape(-1, 2)
+        curr_inliers = curr_pts[inlier_mask].reshape(-1, 2)
+        image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         curr_kf = Keyframe(
             idx=i,
@@ -113,40 +166,52 @@ class SLAMPipeline:
         )
         self.mapper.add_keyframe(curr_kf)
 
-        prev_kf = self.mapper.previous_keyframe
-        if prev_kf is not None:
+        prev_kf_map = self.mapper.previous_keyframe
+        if prev_kf_map is not None:
             rel_pose = _Rt_to_T(R, t)
-            self.pose_graph.add_odometry_edge(prev_kf.idx, curr_kf.idx, rel_pose)
+            self.pose_graph.add_odometry_edge(prev_kf_map.idx, curr_kf.idx, rel_pose)
 
-        inliers = inliers_mask.ravel() == 1
-        prev_inliers = prev_pts[inliers].reshape(-1, 2)
-        curr_inliers = curr_pts[inliers].reshape(-1, 2)
-        image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        # Split inliers: points already tracked (existing 3D point) vs new
+        track_list: list[tuple[int, int, int, int]] = []  # (local_idx, query_kp, train_kp, pt_id)
+        new_indices: list[int] = []
+        for j, m in enumerate(inlier_matches):
+            pt_id = prev_kf_map.kp_to_pt.get(m.queryIdx)
+            if pt_id is not None:
+                track_list.append((j, m.queryIdx, m.trainIdx, pt_id))
+            else:
+                new_indices.append(j)
 
-        candidates = self.triangulator.triangulate(
-            R_prev=self.mapper.previous_keyframe.R,
-            t_prev=self.mapper.previous_keyframe.t,
-            R_curr=self.mapper.current_keyframe.R,
-            t_curr=self.mapper.current_keyframe.t,
-            pts1=prev_inliers,
-            pts2=curr_inliers,
-            image_rgb=image_rgb,
-        )
+        for j, _, train_idx, pt_id in track_list:
+            self.mapper.pointmap.add_observation(pt_id, curr_kf.idx, curr_inliers[j])
+            curr_kf.kp_to_pt[train_idx] = pt_id
 
-        for cand in candidates:
-            pt_id = self.mapper.pointmap.add_point(cand["pt3d"], color=cand["color"])
-            self.mapper.pointmap.add_observation(
-                pt_id, self.mapper.previous_keyframe.idx, cand["uv_prev"]
+        if new_indices:
+            new_prev = prev_inliers[new_indices]
+            new_curr = curr_inliers[new_indices]
+            candidates = self.triangulator.triangulate(
+                R_prev=prev_kf_map.R,
+                t_prev=prev_kf_map.t,
+                R_curr=curr_kf.R,
+                t_curr=curr_kf.t,
+                pts1=new_prev,
+                pts2=new_curr,
+                image_rgb=image_rgb,
             )
-            self.mapper.pointmap.add_observation(
-                pt_id, self.mapper.current_keyframe.idx, cand["uv_curr"]
-            )
+            for cand in candidates:
+                orig_j = new_indices[cand["orig_idx"]]
+                m = inlier_matches[orig_j]
+                pt_id = self.mapper.pointmap.add_point(cand["pt3d"], color=cand["color"])
+                self.mapper.pointmap.add_observation(pt_id, prev_kf_map.idx, cand["uv_prev"])
+                self.mapper.pointmap.add_observation(pt_id, curr_kf.idx, cand["uv_curr"])
+                prev_kf_map.kp_to_pt[m.queryIdx] = pt_id
+                curr_kf.kp_to_pt[m.trainIdx] = pt_id
 
-        if i % cfg.ba_frequency == 0 and i >= cfg.ba_min_frames:
+        n_kfs = len(self.mapper.keyframes)
+        if n_kfs % cfg.ba_frequency == 0 and n_kfs >= cfg.ba_min_frames:
             cfg.bundle_adjustment.run(self.mapper, cfg.K)
 
         loop_closed = False
-        if i % cfg.lc_frequency == 0:
+        if n_kfs % cfg.lc_frequency == 0:
             lc_candidates = cfg.loop_closure_detector.detect(curr_kf, self.mapper, cfg.K)
             for lc in lc_candidates:
                 self.pose_graph.add_loop_closure_edge(
@@ -160,26 +225,31 @@ class SLAMPipeline:
         # revisit, don't re-run PGO unless enough new keyframes have been added
         # since the last optimisation. Avoids pummelling the map with back-to-
         # back PGO+GBA on overlapping detections.
-        run_pgo = loop_closed and (i - self._last_pgo_kf) >= cfg.lc_frequency
+        # run_pgo = loop_closed and (i - self._last_pgo_kf) >= cfg.lc_frequency
 
-        if run_pgo:
-            cfg.pose_graph_optimizer.optimize(self.mapper, self.pose_graph)
-            self._last_pgo_kf = i
+        # if run_pgo:
+        #     cfg.pose_graph_optimizer.optimize(self.mapper, self.pose_graph)
+        #     self._last_pgo_kf = i
 
-        if run_pgo and i >= cfg.gba_min_frames:
-            cfg.global_bundle_adjustment.run(self.mapper, cfg.K)
+        # if run_pgo and i >= cfg.gba_min_frames:
+        #     cfg.global_bundle_adjustment.run(self.mapper, cfg.K)
 
+        # Sync from mapper in case BA updated poses.
         self._R_global = self.mapper.current_keyframe.R.copy()
         self._t_global = self.mapper.current_keyframe.t.copy()
 
-        camera_pos = -self._R_global.T @ self._t_global
-        self.trajectory.append(camera_pos)
+        # Advance keyframe selection state.
+        self._R_last_kf = self._R_global.copy()
+        self._t_last_kf = self._t_global.copy()
+        self._last_kf_frame_idx = i
+        self._last_kf_n_kps = len(curr_kps)
 
-        self.mapper.pointmap.save_pointcloud(cfg.clouds_dir / f"{i}.ply")
-
+        # _prev_* always points to the last inserted keyframe.
         self._prev_keypoints = curr_kps
         self._prev_descriptors = curr_descs
         self._prev_feats = curr_feats
+
+        self.mapper.pointmap.save_pointcloud(cfg.clouds_dir / f"{i}.ply")
         self._frame_idx += 1
 
         return {

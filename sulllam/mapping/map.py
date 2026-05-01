@@ -57,6 +57,7 @@ class Keyframe:
         self.descriptors = descriptors
         self.pose = pose
         self.match_scores = match_scores if match_scores is not None else np.array([])
+        self.kp_to_pt: dict[int, int] = {}  # keypoint index → 3D point ID
 
     @property
     def R(self) -> np.ndarray:

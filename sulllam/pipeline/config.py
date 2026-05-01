@@ -34,6 +34,7 @@ class SLAMConfig:
     pose_graph_optimizer: PoseGraphOptimizer = field(default=None)
 
     max_reproj_error: float = 2.0
+    min_paralax_deg: float = 1.0
     max_depth: float = 50.0
     max_points: int = 100
 
@@ -42,6 +43,11 @@ class SLAMConfig:
     gba_min_frames: int = 30
 
     lc_frequency: int = 10
+
+    kf_min_translation: float = 0.1   # camera-centre distance since last keyframe
+    kf_min_rotation_deg: float = 5.0  # rotation angle since last keyframe
+    kf_max_tracked_ratio: float = 0.9 # insert KF when inliers drop below this fraction of last KF's features
+    kf_max_frames: int = 20           # always insert a keyframe after this many frames
 
     clouds_dir: Path = field(default_factory=lambda: Path("clouds"))
 
