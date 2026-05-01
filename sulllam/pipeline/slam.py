@@ -21,6 +21,54 @@ def _Rt_to_T(R: np.ndarray, t: np.ndarray) -> np.ndarray:
     return T
 
 
+
+_PER_KEYPOINT_KEYS = frozenset({"keypoints", "keypoint_scores", "descriptors", "scales", "oris"})
+
+
+def _filter_by_mask(
+    kps: list,
+    descs: np.ndarray,
+    feats: dict | None,
+    mask: np.ndarray,
+) -> tuple[list, np.ndarray, dict | None, list[int]]:
+    """Drop keypoints that fall inside the boolean exclusion mask (True = exclude).
+
+    Returns filtered (kps, descs, feats, keep_indices) where keep_indices maps
+    new index → original index.
+
+    Note: extract_tensors() returns tensors after rbd(), so shapes are
+    (N, D) / (N,) with no batch dim.  match_tensors() adds the batch dim
+    back via unsqueeze(0) before passing to LightGlue.  We therefore index
+    on dim 0 here, and only for known per-keypoint keys.
+    """
+    h, w = mask.shape[:2]
+    keep = [
+        i for i, kp in enumerate(kps)
+        if not mask[
+            min(int(kp.pt[1]), h - 1),
+            min(int(kp.pt[0]), w - 1),
+        ]
+    ]
+
+    filtered_kps = [kps[i] for i in keep]
+    filtered_descs = descs[keep] if descs is not None and len(keep) > 0 else descs
+
+    filtered_feats: dict | None = None
+    if feats is not None:
+        import torch
+        filtered_feats = {}
+        for k, v in feats.items():
+            if isinstance(v, torch.Tensor) and k in _PER_KEYPOINT_KEYS and len(keep) > 0:
+                filtered_feats[k] = v[keep]
+            elif isinstance(v, torch.Tensor) and k in _PER_KEYPOINT_KEYS and len(keep) == 0:
+                # Preserve correct shape with 0 keypoints
+                filtered_feats[k] = v[:0]
+            else:
+                filtered_feats[k] = v
+
+    return filtered_kps, filtered_descs, filtered_feats, keep
+
+
 class SLAMPipeline:
     def __init__(self, config: SLAMConfig):
         self.config = config
@@ -44,6 +92,8 @@ class SLAMPipeline:
         self._last_pgo_kf: int = -10**9
         self.trajectory: list[np.ndarray] = []
 
+        self._last_seg_mask: np.ndarray | None = None
+
         # Keyframe selection state
         self._R_last_kf = np.eye(3)
         self._t_last_kf = np.zeros(3)
@@ -54,11 +104,19 @@ class SLAMPipeline:
 
     def _initialize(self, image: np.ndarray) -> None:
         kps, descs = self.config.extractor.extract(image)
+        feats: dict | None = None
+        if isinstance(self.config.extractor, SuperPointFeatureExtractor):
+            feats = self.config.extractor.extract_tensors(image)
+
+        if self.config.segmentor is not None:
+            seg_mask = self.config.segmentor.segment(image)
+            self._last_seg_mask = seg_mask
+            kps, descs, feats, _ = _filter_by_mask(kps, descs, feats, seg_mask)
+            print(f"[SLAM] Init: {len(kps)} keypoints after segmentation filter")
+
         self._prev_keypoints = kps
         self._prev_descriptors = descs
-
-        if isinstance(self.config.extractor, SuperPointFeatureExtractor):
-            self._prev_feats = self.config.extractor.extract_tensors(image)
+        self._prev_feats = feats
 
         initial_kf = Keyframe(
             idx=0,
@@ -107,6 +165,12 @@ class SLAMPipeline:
         if isinstance(cfg.extractor, SuperPointFeatureExtractor):
             curr_feats = cfg.extractor.extract_tensors(image)
 
+        keep_for_match: list[int] = list(range(len(curr_kps)))
+        if cfg.segmentor is not None and self._last_seg_mask is not None:
+            curr_kps, curr_descs, curr_feats, keep_for_match = _filter_by_mask(
+                curr_kps, curr_descs, curr_feats, self._last_seg_mask
+            )
+
         if (
             isinstance(cfg.matcher, LightGlueMatcher)
             and curr_feats is not None
@@ -122,7 +186,7 @@ class SLAMPipeline:
             self.trajectory.append(camera_pos)
             self._frame_idx += 1
             return {"matches": matches, "prev_keypoints": self._prev_keypoints,
-                    "curr_keypoints": curr_kps, "image": image}
+                    "curr_keypoints": curr_kps, "image": image, "seg_mask": None}
 
         prev_pts = np.array(
             [self._prev_keypoints[m.queryIdx].pt for m in matches]
@@ -135,7 +199,6 @@ class SLAMPipeline:
         R, t = estimate["R"], estimate["t"].reshape(-1)
         inliers_mask = estimate["inliers_mask"]
 
-        # Compose relative pose against last keyframe (not the previous frame).
         self._R_global = R @ self._R_last_kf
         self._t_global = R @ self._t_last_kf + t
 
@@ -150,11 +213,63 @@ class SLAMPipeline:
                   f"frames_since_kf={i - self._last_kf_frame_idx})")
             self._frame_idx += 1
             return {"matches": matches, "prev_keypoints": self._prev_keypoints,
-                    "curr_keypoints": curr_kps, "image": image}
+                    "curr_keypoints": curr_kps, "image": image, "seg_mask": None}
+
 
         inlier_matches = [m for m, keep in zip(matches, inlier_mask) if keep]
         prev_inliers = prev_pts[inlier_mask].reshape(-1, 2)
         curr_inliers = curr_pts[inlier_mask].reshape(-1, 2)
+
+
+        seg_mask: np.ndarray | None = None
+        if cfg.segmentor is not None:
+            seg_mask = cfg.segmentor.segment(image)
+            self._last_seg_mask = seg_mask
+
+            h, w = seg_mask.shape[:2]
+            keep_for_kf: list[int] = []  # indices into curr_kps (old-mask-filtered)
+            for local_idx, orig_idx in enumerate(keep_for_match):
+                kp = curr_kps[local_idx]
+                y = min(int(kp.pt[1]), h - 1)
+                x = min(int(kp.pt[0]), w - 1)
+                if not seg_mask[y, x]:
+                    keep_for_kf.append(local_idx)
+
+            old_to_new_kf = {old: new for new, old in enumerate(keep_for_kf)}
+            curr_kps    = [curr_kps[j]    for j in keep_for_kf]
+            curr_descs  = curr_descs[keep_for_kf] if curr_descs is not None else curr_descs
+            if curr_feats is not None:
+                import torch
+                curr_feats = {
+                    k: v[keep_for_kf] if isinstance(v, torch.Tensor) and k in _PER_KEYPOINT_KEYS else v
+                    for k, v in curr_feats.items()
+                }
+
+            kept = [
+                (m, p, c)
+                for m, p, c in zip(inlier_matches, prev_inliers, curr_inliers)
+                if m.trainIdx in old_to_new_kf
+            ]
+            if kept:
+                inlier_matches, prev_list, curr_list = [], [], []
+                for m, p, c in kept:
+                    new_m = cv.DMatch()
+                    new_m.queryIdx = m.queryIdx
+                    new_m.trainIdx = old_to_new_kf[m.trainIdx]
+                    new_m.distance = m.distance
+                    inlier_matches.append(new_m)
+                    prev_list.append(p)
+                    curr_list.append(c)
+                prev_inliers = np.array(prev_list)
+                curr_inliers = np.array(curr_list)
+            else:
+                inlier_matches = []
+                prev_inliers = np.empty((0, 2))
+                curr_inliers = np.empty((0, 2))
+
+            print(f"[SLAM] Frame {i}: keyframe — {n_inliers - len(inlier_matches)} "
+                  f"keypoints removed by SAM segmentation")
+
         image_rgb = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
         curr_kf = Keyframe(
@@ -244,7 +359,7 @@ class SLAMPipeline:
         self._last_kf_frame_idx = i
         self._last_kf_n_kps = len(curr_kps)
 
-        # _prev_* always points to the last inserted keyframe.
+        # _prev_* always points to the last inserted keyframe (post-filter).
         self._prev_keypoints = curr_kps
         self._prev_descriptors = curr_descs
         self._prev_feats = curr_feats
@@ -253,10 +368,11 @@ class SLAMPipeline:
         self._frame_idx += 1
 
         return {
-            "matches": matches,
+            "matches": inlier_matches,
             "prev_keypoints": self._prev_keypoints,
             "curr_keypoints": curr_kps,
             "image": image,
+            "seg_mask": seg_mask,
         }
 
     def run(self, images: list[np.ndarray], ros_publisher=None) -> np.ndarray:
@@ -285,11 +401,12 @@ class SLAMPipeline:
         image = frame_info["image"]
         matches = frame_info["matches"]
         curr_kps = frame_info["curr_keypoints"]
+        seg_mask: np.ndarray | None = frame_info.get("seg_mask")
 
         pair = cv.hconcat([prev_image, image])
         match_img = cv.drawMatches(
             prev_image,
-            self.mapper.keyframes[-2].keypoints,
+            self.mapper.keyframes[-2].keypoints if len(self.mapper.keyframes) >= 2 else [],
             image,
             curr_kps,
             matches,
@@ -303,3 +420,6 @@ class SLAMPipeline:
             self.mapper.pointmap.points_3d[: self.mapper.pointmap.num_points],
             self.mapper.pointmap.point_colors[: self.mapper.pointmap.num_points],
         )
+
+        if seg_mask is not None:
+            ros_publisher.publish_segmentation_overlay(image, seg_mask)

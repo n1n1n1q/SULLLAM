@@ -1,4 +1,5 @@
 import rclpy
+import cv2 as cv
 import numpy as np
 
 from nav_msgs.msg import Path
@@ -22,7 +23,8 @@ class ROSPublisherWrapper:
         self.matches_publisher = self.node.create_publisher(Image, 'curent_matches', 10)
 
         self.pointcloud_publisher = self.node.create_publisher(PointCloud2, 'map_points', 10)
-        
+        self.segmentation_publisher = self.node.create_publisher(Image, 'segmentation_overlay', 10)
+
         self.bridge = CvBridge()
         
     def publish_pose(self, translation: np.ndarray, orientation: np.ndarray, frame_id="map"):
@@ -158,6 +160,27 @@ class ROSPublisherWrapper:
         msg.data = cloud_data.tobytes()
         
         self.pointcloud_publisher.publish(msg)
+
+    def publish_segmentation_overlay(self, cv_image, mask, frame_id="camera_link"):
+        """Publish original image and segmentation mask overlay side by side.
+
+        Left half: original frame.
+        Right half: frame with the exclusion mask blended in red.
+        Topic: /segmentation_overlay
+        """
+        import numpy as np
+
+        overlay = cv_image.copy()
+        if mask is not None and mask.any():
+            colored = np.zeros_like(cv_image)
+            colored[mask] = (0, 0, 200)  # red in BGR
+            overlay = cv.addWeighted(cv_image, 1.0, colored, 0.45, 0)
+
+        side_by_side = cv.hconcat([cv_image, overlay])
+        msg = self.bridge.cv2_to_imgmsg(side_by_side, encoding="bgr8")
+        msg.header.stamp = self.node.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        self.segmentation_publisher.publish(msg)
 
     def shutdown(self):
         self.node.destroy_node()

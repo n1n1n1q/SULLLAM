@@ -51,6 +51,10 @@ class SLAMConfig:
 
     clouds_dir: Path = field(default_factory=lambda: Path("clouds"))
 
+    # Optional SAM2-based segmentor. When set, keypoints that fall inside
+    # detected people are removed on every keyframe.
+    segmentor: object = field(default=None)
+
     def __post_init__(self):
         from sulllam.localization.extraction.superpoint import (
             SuperPointFeatureExtractor,
