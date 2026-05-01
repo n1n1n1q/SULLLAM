@@ -37,7 +37,7 @@ class PoseGraph:
         relative_pose: np.ndarray,
         information: np.ndarray | None = None,
     ) -> None:
-        info = information if information is not None else np.eye(6, dtype=np.float64) * 4.0
+        info = information if information is not None else np.eye(6, dtype=np.float64) * 100.0
         self._edges.append(PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=True))
 
     @property
@@ -145,7 +145,23 @@ class PoseGraphOptimizer:
             if edge.from_id not in se3_vars or edge.to_id not in se3_vars:
                 continue
 
-            rel_t = torch.from_numpy(edge.relative_pose[:3, :]).unsqueeze(0).double()
+            # Odometry edges were stamped with cv.recoverPose's unit-norm `t`,
+            # which is wrong once BA has rescaled the trajectory: the constraint
+            # would then drag the chain back to a uniform unit-step path. We
+            # treat odometry as "the pre-LC trajectory is locally trustworthy"
+            # and re-derive each odometry edge from the current keyframe poses
+            # (T_to_from = T_to_w · inv(T_from_w)). LC edges keep their measured
+            # relative_pose because that is the only signal of accumulated drift.
+            if edge.is_loop_closure:
+                rel_4x4 = edge.relative_pose
+            else:
+                T_from_w = np.eye(4)
+                T_from_w[:3, :] = kf_map[edge.from_id].pose[:3, :]
+                T_to_w = np.eye(4)
+                T_to_w[:3, :] = kf_map[edge.to_id].pose[:3, :]
+                rel_4x4 = T_to_w @ np.linalg.inv(T_from_w)
+
+            rel_t = torch.from_numpy(rel_4x4[:3, :]).unsqueeze(0).double()
             rel_var = th.SE3(tensor=rel_t, name=f"pg_rel_{i}")
 
             pose_from = se3_vars[edge.from_id]
@@ -252,11 +268,19 @@ class PoseGraphOptimizer:
             t_corr = R_cw_new @ t_old + t_cw_new
             pose_corrections[kf_id] = (R_corr, t_corr)
 
-        # Anchor each 3D point to a SINGLE keyframe (its earliest observer that
-        # has a correction). Element-wise averaging of rotation matrices across
-        # multiple observing keyframes does not produce a rotation, so it
-        # contracts/skews the point cloud — which then blows up the next BA.
-        sorted_kf_ids = sorted(pose_corrections.keys())
+        # Anchor each 3D point to a SINGLE keyframe (its earliest observer).
+        # Element-wise averaging of rotation matrices across multiple observing
+        # keyframes does not produce a rotation, so it contracts/skews the
+        # point cloud — which then blows up the next BA.
+        #
+        # IMPORTANT: iterate over ALL kf nodes (including the anchor) when
+        # picking each point's earliest observer. Previously this loop only
+        # iterated over `pose_corrections.keys()`, which excludes the anchor;
+        # a point first seen by the anchor and re-observed by, say, kf 5 was
+        # then incorrectly assigned kf 5's correction and dragged off the
+        # anchor's projection — making the post-PGO state inconsistent and
+        # forcing the next GBA's "max_mean_error_per_obs" guard to trip.
+        sorted_kf_ids = sorted(kf_map.keys())
         pt_anchor: dict[int, int] = {}
         for kf_id in sorted_kf_ids:
             obs_ids = mapper.pointmap._kf_to_obs.get(kf_id, [])
@@ -265,10 +289,14 @@ class PoseGraphOptimizer:
                 if pt_id not in pt_anchor:
                     pt_anchor[pt_id] = kf_id
 
+        corrected_pts = 0
         for pt_id, kf_id in pt_anchor.items():
+            if kf_id == anchor_id:
+                continue
             R_corr, t_corr = pose_corrections[kf_id]
             p = mapper.pointmap.points_3d[pt_id]
             mapper.pointmap.points_3d[pt_id] = R_corr @ p + t_corr
+            corrected_pts += 1
 
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
@@ -279,6 +307,6 @@ class PoseGraphOptimizer:
             new_pose[:3, :] = new_3x4
             kf.pose = new_pose
 
-        print(f"[PG] Corrected {len(pt_anchor)} 3D points "
+        print(f"[PG] Corrected {corrected_pts} 3D points "
               f"(single anchor per point, {len(pose_corrections)} keyframes updated)")
         print(f"[PG] --- Pose Graph Optimization Complete ---\n")

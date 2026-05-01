@@ -10,15 +10,17 @@ from sulllam.mapping.map import Keyframe, Mapper
 
 @dataclass
 class LoopClosureConfig:
-    min_matches: int = 30
+    min_matches: int = 50
     min_frame_gap: int = 30
     ransac_reproj_threshold: float = 3.0
     ransac_confidence: float = 0.995
-    min_inlier_ratio: float = 0.5
+    min_inlier_ratio: float = 0.6
     # Cap how many loop-closure edges may be returned per detector call. Keeps
     # PGO from being swamped by dozens of near-duplicate "loops" produced by a
     # forward-moving camera with overlapping textures.
     max_candidates: int = 1
+    max_rotation_deg: float = 45.0
+    min_median_parallax_px: float = 5.0
 
 
 class LoopClosureDetector:
@@ -70,6 +72,12 @@ class LoopClosureDetector:
                 [kf.keypoints[m.trainIdx].pt for m in good], dtype=np.float32
             )
 
+            median_parallax = float(
+                np.median(np.linalg.norm(query_pts - train_pts, axis=1))
+            )
+            if median_parallax < cfg.min_median_parallax_px:
+                continue
+
             E, mask = cv.findEssentialMat(
                 query_pts,
                 train_pts,
@@ -90,6 +98,11 @@ class LoopClosureDetector:
 
             _, R, t, _ = cv.recoverPose(E, query_pts, train_pts, K, mask=mask)
 
+            cos_theta = np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)
+            rot_angle_deg = float(np.degrees(np.arccos(cos_theta)))
+            if rot_angle_deg > cfg.max_rotation_deg:
+                continue
+
             T_match_query = np.eye(4)
             T_match_query[:3, :3] = R
             T_match_query[:3, 3] = t.flatten()
@@ -101,18 +114,16 @@ class LoopClosureDetector:
                 "relative_pose": relative_pose,
                 "num_inliers": num_inliers,
                 "inlier_ratio": inlier_ratio,
+                "rot_angle_deg": rot_angle_deg,
             })
 
-        # Keep only the strongest candidates (by inlier count). For monocular
-        # SLAM with continuous motion, almost every nearby keyframe will pass
-        # the geometric check; returning all of them creates hundreds of fake
-        # loop-closure edges that drown out the odometry chain in PGO.
         candidates.sort(key=lambda c: c["num_inliers"], reverse=True)
         if cfg.max_candidates > 0:
             candidates = candidates[: cfg.max_candidates]
 
         for c in candidates:
-            print(f"[LC] Loop closure: kf {c['query_kf'].idx} ↔ kf {c['match_kf'].idx}  "
-                  f"({c['num_inliers']} inliers, ratio {c['inlier_ratio']:.2f})")
+            print(f"[LC] Loop closure: kf {c['query_kf'].idx} <-> kf {c['match_kf'].idx}  "
+                  f"({c['num_inliers']} inliers, ratio {c['inlier_ratio']:.2f}, "
+                  f"rot {c['rot_angle_deg']:.1f} deg)")
 
         return candidates
