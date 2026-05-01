@@ -20,6 +20,8 @@ class Triangulator:
         pts1: np.ndarray,
         pts2: np.ndarray,
         image_rgb: np.ndarray,
+        kp_indices_prev: np.ndarray | list[int] | None = None,
+        kp_indices_curr: np.ndarray | list[int] | None = None,
     ) -> list[dict]:
         K = self.K
         P1 = K @ np.hstack((R_prev, t_prev.reshape(3, 1)))
@@ -54,13 +56,20 @@ class Triangulator:
             if not (0 <= v < image_rgb.shape[0] and 0 <= u < image_rgb.shape[1]):
                 continue
 
-            candidates.append({
+            cand = {
                 "error": err1[idx] + err2[idx],
                 "pt3d": pt3d,
                 "color": image_rgb[v, u],
                 "uv_prev": pts1[idx],
                 "uv_curr": pts2[idx],
-            })
+                "depth_prev": float(pts3d_cam1[idx, 2]),
+                "depth_curr": float(pts3d_cam2[idx, 2]),
+            }
+            if kp_indices_prev is not None:
+                cand["kp_idx_prev"] = int(kp_indices_prev[idx])
+            if kp_indices_curr is not None:
+                cand["kp_idx_curr"] = int(kp_indices_curr[idx])
+            candidates.append(cand)
 
         candidates.sort(key=lambda x: x["error"])
         return candidates[: self.max_points]

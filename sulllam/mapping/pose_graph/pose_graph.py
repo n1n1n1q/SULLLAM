@@ -14,6 +14,11 @@ class PoseGraphEdge:
     relative_pose: np.ndarray
     information: np.ndarray = field(default_factory=lambda: np.eye(6, dtype=np.float64))
     is_loop_closure: bool = False
+    # Rotation-only edges constrain only the orientation block of the
+    # residual. Used for loop-closure edges (monocular scale ambiguity) and
+    # for odometry edges where the camera was nearly stationary translation-
+    # wise (pure rotation), making the essential-matrix t direction noise.
+    rotation_only: bool = False
 
 
 class PoseGraph:
@@ -26,9 +31,13 @@ class PoseGraph:
         to_id: int,
         relative_pose: np.ndarray,
         information: np.ndarray | None = None,
+        rotation_only: bool = False,
     ) -> None:
         info = information if information is not None else np.eye(6, dtype=np.float64)
-        self._edges.append(PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=False))
+        self._edges.append(PoseGraphEdge(
+            from_id, to_id, relative_pose, info,
+            is_loop_closure=False, rotation_only=rotation_only,
+        ))
 
     def add_loop_closure_edge(
         self,
@@ -38,7 +47,12 @@ class PoseGraph:
         information: np.ndarray | None = None,
     ) -> None:
         info = information if information is not None else np.eye(6, dtype=np.float64) * 4.0
-        self._edges.append(PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=True))
+        # Loop-closure edges are intrinsically rotation-only because their
+        # translation comes from a unit-norm essential-matrix decomposition.
+        self._edges.append(PoseGraphEdge(
+            from_id, to_id, relative_pose, info,
+            is_loop_closure=True, rotation_only=True,
+        ))
 
     @property
     def edges(self) -> list[PoseGraphEdge]:
@@ -151,29 +165,34 @@ class PoseGraphOptimizer:
             pose_from = se3_vars[edge.from_id]
             pose_to = se3_vars[edge.to_id]
 
-            # Loop closures from monocular essential-matrix decomposition have
-            # unit-norm translation (scale ambiguity), so we constrain rotation
-            # only. Odometry edges keep the full 6-DoF residual.
-            if edge.is_loop_closure:
+            # Rotation-only edges (all loop closures, plus odometry edges
+            # flagged as pure rotation) drop the translation block of the
+            # residual. Translation-bearing odometry edges keep the full
+            # 6-DoF residual.
+            if edge.rotation_only:
                 err_dim = 3
                 err_full = _pose_graph_rot_error
                 err_fixed_from = _pose_graph_rot_error_fixed_from
                 err_fixed_to = _pose_graph_rot_error_fixed_to
                 # Use the rotation block of the information matrix.
                 info_block = edge.information[3:, 3:]
-                info_mean = float(np.trace(info_block) / 3.0)
+                diag = np.maximum(np.diag(info_block).astype(np.float64), 1e-9)
             else:
                 err_dim = 6
                 err_full = _pose_graph_error
                 err_fixed_from = _pose_graph_error_fixed_from
                 err_fixed_to = _pose_graph_error_fixed_to
-                info_mean = float(np.trace(edge.information) / 6.0)
+                diag = np.maximum(np.diag(edge.information).astype(np.float64), 1e-9)
 
-            # ScaleCostWeight multiplies the residual, so the squared cost is
-            # multiplied by scale**2. For a Mahalanobis cost r^T (lambda*I) r
-            # the matching scalar weight is sqrt(lambda).
-            edge_weight = th.ScaleCostWeight(
-                torch.tensor(np.sqrt(max(info_mean, 0.0)), dtype=torch.float64)
+            # DiagonalCostWeight multiplies the residual element-wise, so the
+            # squared cost picks up diag(weight)**2 per dimension. For a
+            # Mahalanobis cost r^T diag(lambda_i) r the matching per-dim
+            # weight is sqrt(lambda_i). This lets us downweight translation
+            # vs rotation independently on odometry edges (the monocular
+            # translation magnitude is uncertain, the rotation isn't).
+            sqrt_diag = np.sqrt(diag)
+            edge_weight = th.DiagonalCostWeight(
+                torch.tensor(sqrt_diag, dtype=torch.float64).unsqueeze(0)
             )
 
             if edge.from_id == anchor_id:
@@ -226,15 +245,23 @@ class PoseGraphOptimizer:
         info = optimizer.optimize()
 
         final_error = objective.error_metric().sum().item()
+        converged_iter = info.converged_iter[0].item()
+        if converged_iter < 0:
+            iter_str = f"max ({cfg.max_iterations})"
+        else:
+            iter_str = str(converged_iter + 1)
         print(f"[PG] Status      : {info.status[0]}")
-        print(f"[PG] Iterations  : {info.converged_iter[0].item() + 1}")
+        print(f"[PG] Iterations  : {iter_str}")
         print(f"[PG] Final error : {final_error:.4f}  (delta {initial_error - final_error:.4f})")
 
         # Per-keyframe correction transform that takes a world point seen by
         # the OLD pose to its consistent location under the NEW pose:
         #     p_new = R_corr @ p_old + t_corr
         # with R_corr = R_wc_new^T @ R_wc_old and t_corr = R_wc_new^T @ (t_wc_old - t_wc_new).
-        pose_corrections: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        # The anchor keyframe's correction is identity by definition.
+        pose_corrections: dict[int, tuple[np.ndarray, np.ndarray]] = {
+            anchor_id: (np.eye(3), np.zeros(3))
+        }
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
                 continue
@@ -252,23 +279,25 @@ class PoseGraphOptimizer:
             t_corr = R_cw_new @ t_old + t_cw_new
             pose_corrections[kf_id] = (R_corr, t_corr)
 
-        # Anchor each 3D point to a SINGLE keyframe (its earliest observer that
-        # has a correction). Element-wise averaging of rotation matrices across
-        # multiple observing keyframes does not produce a rotation, so it
-        # contracts/skews the point cloud — which then blows up the next BA.
-        sorted_kf_ids = sorted(pose_corrections.keys())
-        pt_anchor: dict[int, int] = {}
-        for kf_id in sorted_kf_ids:
-            obs_ids = mapper.pointmap._kf_to_obs.get(kf_id, [])
-            for obs_id in obs_ids:
-                pt_id = int(mapper.pointmap.observations[obs_id, 0])
-                if pt_id not in pt_anchor:
-                    pt_anchor[pt_id] = kf_id
-
-        for pt_id, kf_id in pt_anchor.items():
-            R_corr, t_corr = pose_corrections[kf_id]
+        # Anchor each 3D point explicitly to the keyframe in which it was
+        # triangulated. With each map point now potentially shared across
+        # many keyframes (post-LC fusion / association), there is no longer
+        # a single "earliest observer with a correction" — but there *is*
+        # always exactly one triangulating keyframe per point, recorded at
+        # creation time.
+        applied = 0
+        skipped_no_tri = 0
+        for pt_id in mapper.pointmap.alive_point_ids():
+            tri_kf_id = int(mapper.pointmap.triangulating_kf[pt_id])
+            if tri_kf_id < 0:
+                skipped_no_tri += 1
+                continue
+            if tri_kf_id not in pose_corrections:
+                continue
+            R_corr, t_corr = pose_corrections[tri_kf_id]
             p = mapper.pointmap.points_3d[pt_id]
             mapper.pointmap.points_3d[pt_id] = R_corr @ p + t_corr
+            applied += 1
 
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
@@ -279,6 +308,8 @@ class PoseGraphOptimizer:
             new_pose[:3, :] = new_3x4
             kf.pose = new_pose
 
-        print(f"[PG] Corrected {len(pt_anchor)} 3D points "
-              f"(single anchor per point, {len(pose_corrections)} keyframes updated)")
+        print(f"[PG] Corrected {applied} 3D points "
+              f"(anchored to triangulating keyframe, "
+              f"{len(pose_corrections) - 1} keyframes updated, "
+              f"{skipped_no_tri} points skipped — no triangulating KF recorded)")
         print(f"[PG] --- Pose Graph Optimization Complete ---\n")

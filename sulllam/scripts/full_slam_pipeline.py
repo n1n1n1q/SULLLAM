@@ -60,21 +60,25 @@ def _build_args() -> argparse.Namespace:
     parser.add_argument("--max-frames", type=int, default=None,
                         help="Stop after this many frames")
 
-    parser.add_argument("--ba-frequency", type=int, default=5,
-                        help="Run local BA every N frames")
-    parser.add_argument("--ba-min-frames", type=int, default=12,
-                        help="Minimum frames before running local BA")
-    parser.add_argument("--gba-min-frames", type=int, default=30,
-                        help="Minimum frames before running global BA")
+    parser.add_argument("--ba-frequency", type=int, default=3,
+                        help="Run local BA every N keyframes")
+    parser.add_argument("--ba-min-frames", type=int, default=6,
+                        help="Minimum keyframes before running local BA")
+    parser.add_argument("--gba-min-frames", type=int, default=15,
+                        help="Minimum keyframes before running global BA")
 
-    parser.add_argument("--lc-frequency", type=int, default=10,
-                        help="Run loop-closure detection every N frames")
-    parser.add_argument("--lc-min-matches", type=int, default=30,
+    parser.add_argument("--lc-frequency", type=int, default=5,
+                        help="Run loop-closure detection every N keyframes")
+    parser.add_argument("--lc-min-matches", type=int, default=80,
                         help="Minimum descriptor matches required for a LC candidate")
-    parser.add_argument("--lc-min-frame-gap", type=int, default=20,
-                        help="Minimum frame gap to consider a keyframe pair as LC")
-    parser.add_argument("--lc-min-inlier-ratio", type=float, default=0.3,
+    parser.add_argument("--lc-min-inliers", type=int, default=60,
+                        help="Minimum absolute inlier count required for a LC candidate")
+    parser.add_argument("--lc-min-kf-gap", type=int, default=10,
+                        help="Minimum keyframe-position gap before a pair is eligible as LC")
+    parser.add_argument("--lc-min-inlier-ratio", type=float, default=0.7,
                         help="Minimum essential-matrix inlier ratio for a LC candidate")
+    parser.add_argument("--lc-appearance-threshold", type=float, default=0.4,
+                        help="Min cosine similarity of mean-pooled descriptors to consider LC")
 
     parser.add_argument("--pgo-max-iterations", type=int, default=20,
                         help="Max LM iterations for pose-graph optimisation")
@@ -118,8 +122,10 @@ def _build_config(args: argparse.Namespace, K: np.ndarray) -> SLAMConfig:
     gba_cfg = GlobalBundleAdjustmentConfig()
     lc_cfg = LoopClosureConfig(
         min_matches=args.lc_min_matches,
-        min_frame_gap=args.lc_min_frame_gap,
+        min_inliers=args.lc_min_inliers,
+        min_kf_gap=args.lc_min_kf_gap,
         min_inlier_ratio=args.lc_min_inlier_ratio,
+        appearance_threshold=args.lc_appearance_threshold,
     )
     pgo_cfg = PoseGraphOptimizerConfig(
         max_iterations=args.pgo_max_iterations,

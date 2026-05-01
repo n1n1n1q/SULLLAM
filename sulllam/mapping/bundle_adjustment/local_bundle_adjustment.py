@@ -14,10 +14,22 @@ from sulllam.preprocessing.entropy import image_entropy, map_entropy_to_alpha
 @dataclass
 class LocalBundleAdjustmentConfig:
     window_size: int = 20
-    huber_radius: float = 2.0
-    max_iterations: int = 10
+    # Huber radius (pixels). Reprojection errors above this enter Huber's
+    # linear regime, where the gradient saturates. Setting it too small
+    # (e.g. 2 px) on a pipeline whose pre-BA reprojection errors are
+    # routinely 10-30 px stalls LM — it can't find a step that lowers
+    # the saturated cost. 5 px gives the optimizer enough quadratic basin
+    # to find a useful direction while still robustifying against outliers.
+    huber_radius: float = 5.0
+    max_iterations: int = 15
     abs_err_tolerance: float = 1e-4
     rel_err_tolerance: float = 1e-4
+    # LM step-size scaling. ``1.0`` (the Theseus default) takes the full
+    # Gauss-Newton step on each accepted iteration, which on this problem
+    # tends to overshoot the basin and gets every step rejected. ``0.2``
+    # is conservative enough that the first few iterations actually move
+    # things in the right direction.
+    step_size: float = 0.2
     use_match_confidence: bool = False
     confidence_gamma: float = 1.0
     use_adaptive_barron: bool = False
@@ -82,7 +94,39 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
             return
 
         ba_obs = all_obs[np.isin(all_obs[:, 1], list(local_kf_ids))]
-        local_point_ids = np.unique(ba_obs[:, 0]).astype(int)
+
+        # Pre-filter: skip dead points and observations that fail cheirality
+        # in the *current* state. After PGO with rigid corrections, multi-
+        # view points can land behind some of their observers; including
+        # those produces near-singular Jacobians that crash the Cholesky
+        # solver in LM.
+        if len(ba_obs) > 0:
+            pre_n = len(ba_obs)
+            keep = np.zeros(len(ba_obs), dtype=bool)
+            kf_pose_by_id = {kf.idx: kf.pose for kf in mapper.keyframes}
+            for j in range(len(ba_obs)):
+                pt_id = int(ba_obs[j, 0])
+                kf_id = int(ba_obs[j, 1])
+                if mapper.pointmap.is_dead(pt_id):
+                    continue
+                pose = kf_pose_by_id.get(kf_id)
+                if pose is None:
+                    continue
+                R_p = pose[:3, :3]
+                t_p = pose[:3, 3]
+                pt = mapper.pointmap.points_3d[pt_id]
+                if not np.all(np.isfinite(pt)):
+                    continue
+                z = float((R_p @ pt + t_p)[2])
+                if z > 1e-3:
+                    keep[j] = True
+            ba_obs = ba_obs[keep]
+            dropped = pre_n - len(ba_obs)
+            if dropped > 0:
+                print(f"[BA] Pre-filtered {dropped} observations "
+                      f"(dead points + cheirality failures)")
+
+        local_point_ids = np.unique(ba_obs[:, 0]).astype(int) if len(ba_obs) else np.array([], dtype=int)
 
         if len(local_point_ids) == 0:
             print("[BA] No 3D points in the local window. Skipping.")
@@ -137,11 +181,15 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
         print(f"[BA] Anchored (fixed) keyframe: {fixed_kf_id}")
 
         fixed_edges = opt_edges = 0
-        for o in ba_obs:
+        for o_idx, o in enumerate(ba_obs):
             pt_id = int(o[0])
             kf_id = int(o[1])
+            # Observation index makes names unique even when multiple
+            # keypoints in the same keyframe map to the same point (after
+            # cross-LC duplicate fusion).
+            uname = f"{pt_id}_{kf_id}_{o_idx}"
             uv_obs = torch.tensor([[o[2], o[3]]], dtype=torch.float64)
-            uv_var = th.Vector(tensor=uv_obs, name=f"uv_{pt_id}_{kf_id}")
+            uv_var = th.Vector(tensor=uv_obs, name=f"uv_{uname}")
             cam_var = se3_vars[kf_id]
             pt_var = pt_vars[pt_id]
 
@@ -161,7 +209,7 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
                     dim=2,
                     aux_vars=[cam_var, K_var, uv_var],
                     cost_weight=edge_weight,
-                    name=f"cost_{pt_id}_{kf_id}",
+                    name=f"cost_{uname}",
                 )
                 fixed_edges += 1
             else:
@@ -171,7 +219,7 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
                     dim=2,
                     aux_vars=[K_var, uv_var],
                     cost_weight=edge_weight,
-                    name=f"cost_{pt_id}_{kf_id}",
+                    name=f"cost_{uname}",
                 )
                 opt_edges += 1
 
@@ -179,7 +227,7 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
                 cost_function=cost_fn,
                 loss_cls=th.HuberLoss,
                 log_loss_radius=log_loss_radius,
-                name=f"robust_{pt_id}_{kf_id}",
+                name=f"robust_{uname}",
             ))
 
         print(f"[BA] Graph: {fixed_edges} fixed-cam edges, {opt_edges} opt-cam edges")
@@ -191,19 +239,46 @@ class LocalBundleAdjustment(BaseBundleAdjustment):
         optimizer = th.LevenbergMarquardt(
             objective,
             max_iterations=cfg.max_iterations,
-            step_size=1.0,
+            step_size=cfg.step_size,
             abs_err_tolerance=cfg.abs_err_tolerance,
             rel_err_tolerance=cfg.rel_err_tolerance,
             linearization_cls=th.SparseLinearization,
             linear_solver_cls=th.CholmodSparseSolver,
             vectorize=True,
         )
-        info = optimizer.optimize()
+        try:
+            info = optimizer.optimize()
+        except Exception as exc:
+            # Cholmod's not-positive-definite error and similar numerical
+            # failures shouldn't take the whole pipeline down — the map
+            # state is still whatever it was before this BA call.
+            print(f"[BA] LM optimize raised {type(exc).__name__}: {exc}")
+            print(f"[BA] --- Local Bundle Adjustment Complete ---\n")
+            return
 
         final_error = objective.error_metric().sum().item()
+        converged_iter = info.converged_iter[0].item()
+        # Theseus reports ``converged_iter = -1`` when LM ran the full
+        # iteration budget without hitting abs/rel tolerance. The "+1"
+        # convention then prints "Iterations: 0", which is wrong and
+        # misleading — LM actually executed ``max_iterations`` steps.
+        if converged_iter < 0:
+            iter_str = f"max ({cfg.max_iterations})"
+        else:
+            iter_str = str(converged_iter + 1)
         print(f"[BA] Status      : {info.status[0]}")
-        print(f"[BA] Iterations  : {info.converged_iter[0].item() + 1}")
+        print(f"[BA] Iterations  : {iter_str}")
         print(f"[BA] Final error : {final_error:.4f}  (Δ {initial_error - final_error:.4f})")
+
+        # Discard when the optimizer left us in a worse or non-finite state.
+        # Theseus's ``converged_iter`` is ``-1`` whenever the absolute/relative
+        # tolerance wasn't reached, *even when LM accepted many steps*, so we
+        # don't gate on it directly — the error-metric comparison is a
+        # truer signal of whether to commit.
+        if not np.isfinite(final_error) or final_error >= initial_error:
+            print(f"[BA] Error increased or is non-finite — discarding results.")
+            print(f"[BA] --- Local Bundle Adjustment Complete ---\n")
+            return
 
         for kf_id, cam_var in se3_vars.items():
             if kf_id == fixed_kf_id:

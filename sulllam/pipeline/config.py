@@ -32,16 +32,27 @@ class SLAMConfig:
     global_bundle_adjustment: BaseBundleAdjustment = field(default=None)
     loop_closure_detector: LoopClosureDetector = field(default=None)
     pose_graph_optimizer: PoseGraphOptimizer = field(default=None)
+    # Keyframe selection. Type is a forward reference (defined in slam.py)
+    # to avoid an import cycle here.
+    kf_selection: object = field(default=None)
+    # Odometry scaling / information weighting. Same forward-reference
+    # treatment.
+    odom_scale: object = field(default=None)
+    # Tracking-failure detection (sharp turns / motion blur / occlusion).
+    # Same forward-reference treatment.
+    tracking_failure: object = field(default=None)
 
     max_reproj_error: float = 2.0
     max_depth: float = 50.0
     max_points: int = 100
 
-    ba_frequency: int = 5
-    ba_min_frames: int = 12
-    gba_min_frames: int = 30
+    # Cadence is now in *keyframes*, not raw frames. With keyframe selection
+    # enabled (default), this is what users actually want.
+    ba_frequency: int = 3
+    ba_min_frames: int = 6
+    gba_min_frames: int = 15
 
-    lc_frequency: int = 10
+    lc_frequency: int = 5
 
     clouds_dir: Path = field(default_factory=lambda: Path("clouds"))
 
