@@ -19,6 +19,7 @@ from sulllam.mapping.bundle_adjustment.global_bundle_adjustment import (
 )
 from sulllam.mapping.loop_closure import LoopClosureDetector, LoopClosureConfig
 from sulllam.mapping.pose_graph import PoseGraphOptimizer, PoseGraphOptimizerConfig
+from sulllam.preprocessing.dynamic_filter import DynamicKeypointFilter
 
 
 @dataclass
@@ -32,6 +33,7 @@ class SLAMConfig:
     global_bundle_adjustment: BaseBundleAdjustment = field(default=None)
     loop_closure_detector: LoopClosureDetector = field(default=None)
     pose_graph_optimizer: PoseGraphOptimizer = field(default=None)
+    dynamic_filter: DynamicKeypointFilter | None = field(default=None)
 
     max_reproj_error: float = 2.0
     max_depth: float = 50.0

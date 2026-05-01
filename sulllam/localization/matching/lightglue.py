@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import cv2 as cv
@@ -11,6 +11,7 @@ from lightglue import LightGlue as _LightGlue
 from lightglue.utils import rbd
 
 from sulllam.localization.matching.base_matcher import BaseMatcher
+from sulllam.localization.matching.match_filter import MatchFilterConfig, apply_match_filters
 
 if TYPE_CHECKING:
     from sulllam.localization.extraction.superpoint import SuperPointFeatureExtractor
@@ -25,6 +26,7 @@ class LightGlueConfig:
     n_layers: int = 9
     flash: bool = True
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    match_filter: MatchFilterConfig | None = None
 
 
 class LightGlueMatcher(BaseMatcher):
@@ -93,4 +95,24 @@ class LightGlueMatcher(BaseMatcher):
             cv.DMatch(int(m[0]), int(m[1]), float(1.0 - s))
             for m, s in zip(matches_np, scores_np)
         ]
+
+        if self.config.match_filter is not None and dm_list:
+            kps0 = _tensor_to_keypoints(feats0["keypoints"])
+            kps1 = _tensor_to_keypoints(feats1["keypoints"])
+            if kps0 and kps1:
+                kept_dms = apply_match_filters(dm_list, kps0, kps1, self.config.match_filter)
+                kept_idx = {id(m) for m in kept_dms}
+                mask = np.array([id(m) in kept_idx for m in dm_list])
+                dm_list = kept_dms
+                scores_np = scores_np[mask]
+
         return dm_list, scores_np
+
+
+def _tensor_to_keypoints(kpts_tensor: torch.Tensor) -> list[cv.KeyPoint]:
+    """Convert a (1, N, 2) or (N, 2) tensor to cv.KeyPoint list."""
+    t = kpts_tensor
+    if t.dim() == 3:
+        t = t.squeeze(0)
+    pts = t.cpu().numpy()
+    return [cv.KeyPoint(float(x), float(y), 1.0) for x, y in pts]

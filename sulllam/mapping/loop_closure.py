@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2 as cv
 import numpy as np
@@ -15,9 +15,6 @@ class LoopClosureConfig:
     ransac_reproj_threshold: float = 3.0
     ransac_confidence: float = 0.995
     min_inlier_ratio: float = 0.6
-    # Cap how many loop-closure edges may be returned per detector call. Keeps
-    # PGO from being swamped by dozens of near-duplicate "loops" produced by a
-    # forward-moving camera with overlapping textures.
     max_candidates: int = 1
     max_rotation_deg: float = 45.0
     min_median_parallax_px: float = 5.0
@@ -29,6 +26,14 @@ class LoopClosureDetector:
         index_params = {"algorithm": 1, "trees": 5}
         search_params = {"checks": 50}
         self._flann = cv.FlannBasedMatcher(index_params, search_params)
+
+    def _candidate_keyframes(self, current_kf: Keyframe, mapper: Mapper) -> list[Keyframe]:
+        return [
+            kf for kf in mapper.keyframes
+            if kf.idx <= current_kf.idx - self.config.min_frame_gap
+            and kf.descriptors is not None
+            and len(kf.descriptors) > 0
+        ]
 
     def detect(
         self,
@@ -44,12 +49,7 @@ class LoopClosureDetector:
 
         query_descs = np.asarray(current_kf.descriptors, dtype=np.float32)
 
-        for kf in mapper.keyframes:
-            if kf.idx >= current_kf.idx - cfg.min_frame_gap:
-                continue
-            if kf.descriptors is None or len(kf.descriptors) == 0:
-                continue
-
+        for kf in self._candidate_keyframes(current_kf, mapper):
             train_descs = np.asarray(kf.descriptors, dtype=np.float32)
 
             try:

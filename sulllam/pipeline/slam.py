@@ -45,13 +45,25 @@ class SLAMPipeline:
 
         config.clouds_dir.mkdir(parents=True, exist_ok=True)
 
+    def _extract_filtered(self, image: np.ndarray):
+        """Extract features and apply dynamic-keypoint filter (if configured)."""
+        cfg = self.config
+        kps, descs = cfg.extractor.extract(image)
+        feats = None
+        if isinstance(cfg.extractor, SuperPointFeatureExtractor):
+            feats = cfg.extractor.extract_tensors(image)
+
+        if cfg.dynamic_filter is not None and cfg.dynamic_filter.config.enabled:
+            kps, descs, keep = cfg.dynamic_filter.filter(image, kps, descs)
+            if feats is not None:
+                feats = cfg.dynamic_filter.filter_tensors(feats, keep)
+        return kps, descs, feats
+
     def _initialize(self, image: np.ndarray) -> None:
-        kps, descs = self.config.extractor.extract(image)
+        kps, descs, feats = self._extract_filtered(image)
         self._prev_keypoints = kps
         self._prev_descriptors = descs
-
-        if isinstance(self.config.extractor, SuperPointFeatureExtractor):
-            self._prev_feats = self.config.extractor.extract_tensors(image)
+        self._prev_feats = feats
 
         initial_kf = Keyframe(
             idx=0,
@@ -67,10 +79,7 @@ class SLAMPipeline:
         cfg = self.config
         i = self._frame_idx
 
-        curr_kps, curr_descs = cfg.extractor.extract(image)
-        curr_feats: dict | None = None
-        if isinstance(cfg.extractor, SuperPointFeatureExtractor):
-            curr_feats = cfg.extractor.extract_tensors(image)
+        curr_kps, curr_descs, curr_feats = self._extract_filtered(image)
 
         if (
             isinstance(cfg.matcher, LightGlueMatcher)
@@ -217,14 +226,17 @@ class SLAMPipeline:
         curr_kps = frame_info["curr_keypoints"]
 
         pair = cv.hconcat([prev_image, image])
-        match_img = cv.drawMatches(
-            prev_image,
-            self.mapper.keyframes[-2].keypoints,
-            image,
-            curr_kps,
-            matches,
-            None,
-        )
+        if len(self.mapper.keyframes) >= 2:
+            match_img = cv.drawMatches(
+                prev_image,
+                self.mapper.keyframes[-2].keypoints,
+                image,
+                curr_kps,
+                matches,
+                None,
+            )
+        else:
+            match_img = pair
 
         ros_publisher.publish_trajectory(translations, orientations)
         ros_publisher.publish_current_pair(pair)
