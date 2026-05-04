@@ -124,4 +124,4 @@ The `ROSPublisherWrapper` in `sulllam/utils/ros.py` handles publishing and shuts
 
 ## License
 
-GNU General Public License v3.0 — see [LICENSE](LICENSE).
+GNU General Public License v3.0 -- see [LICENSE](LICENSE).
