@@ -1,7 +1,5 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-
 import numpy as np
 import torch
 import theseus as th
@@ -17,6 +15,7 @@ class PoseGraphEdge:
 
 
 class PoseGraph:
+
     def __init__(self) -> None:
         self._edges: list[PoseGraphEdge] = []
 
@@ -28,7 +27,9 @@ class PoseGraph:
         information: np.ndarray | None = None,
     ) -> None:
         info = information if information is not None else np.eye(6, dtype=np.float64)
-        self._edges.append(PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=False))
+        self._edges.append(
+            PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=False)
+        )
 
     def add_loop_closure_edge(
         self,
@@ -37,8 +38,14 @@ class PoseGraph:
         relative_pose: np.ndarray,
         information: np.ndarray | None = None,
     ) -> None:
-        info = information if information is not None else np.eye(6, dtype=np.float64) * 100.0
-        self._edges.append(PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=True))
+        info = (
+            information
+            if information is not None
+            else np.eye(6, dtype=np.float64) * 100.0
+        )
+        self._edges.append(
+            PoseGraphEdge(from_id, to_id, relative_pose, info, is_loop_closure=True)
+        )
 
     @property
     def edges(self) -> list[PoseGraphEdge]:
@@ -49,7 +56,7 @@ class PoseGraph:
         return [e for e in self._edges if e.is_loop_closure]
 
     def has_loop_closures(self) -> bool:
-        return any(e.is_loop_closure for e in self._edges)
+        return any((e.is_loop_closure for e in self._edges))
 
 
 def _pose_graph_error(optim_vars, aux_vars):
@@ -97,61 +104,46 @@ def _pose_graph_rot_error_fixed_to(optim_vars, aux_vars):
 @dataclass
 class PoseGraphOptimizerConfig:
     max_iterations: int = 20
-    abs_err_tolerance: float = 1e-5
-    rel_err_tolerance: float = 1e-5
+    abs_err_tolerance: float = 1e-05
+    rel_err_tolerance: float = 1e-05
     step_size: float = 1.0
 
 
 class PoseGraphOptimizer:
+
     def __init__(self, config: PoseGraphOptimizerConfig | None = None) -> None:
         self.config = config or PoseGraphOptimizerConfig()
 
     def optimize(self, mapper, pose_graph: PoseGraph) -> None:
         cfg = self.config
         print(f"\n[PG] --- Starting Pose Graph Optimization ---")
-
         if len(mapper.keyframes) < 2:
             print("[PG] Not enough keyframes. Skipping.")
             return
-
         if not pose_graph.has_loop_closures():
             print("[PG] No loop closures. Skipping.")
             return
-
         node_ids: set[int] = set()
         for edge in pose_graph.edges:
             node_ids.add(edge.from_id)
             node_ids.add(edge.to_id)
-
         kf_map = {kf.idx: kf for kf in mapper.keyframes if kf.idx in node_ids}
         if len(kf_map) < 2:
             print("[PG] Insufficient keyframes in pose graph. Skipping.")
             return
-
-        print(f"[PG] Nodes: {len(kf_map)}, Edges: {len(pose_graph.edges)} "
-              f"({len(pose_graph.loop_closure_edges)} loop closures)")
-
+        print(
+            f"[PG] Nodes: {len(kf_map)}, Edges: {len(pose_graph.edges)} ({len(pose_graph.loop_closure_edges)} loop closures)"
+        )
         se3_vars: dict[int, th.SE3] = {}
         for kf_id, kf in kf_map.items():
             t = torch.from_numpy(kf.pose[:3, :]).unsqueeze(0).double()
             se3_vars[kf_id] = th.SE3(tensor=t, name=f"pg_cam_{kf_id}")
-
         anchor_id = min(kf_map.keys())
         print(f"[PG] Anchored keyframe: {anchor_id}")
-
         objective = th.Objective(dtype=torch.float64)
-
         for i, edge in enumerate(pose_graph.edges):
             if edge.from_id not in se3_vars or edge.to_id not in se3_vars:
                 continue
-
-            # Odometry edges were stamped with cv.recoverPose's unit-norm `t`,
-            # which is wrong once BA has rescaled the trajectory: the constraint
-            # would then drag the chain back to a uniform unit-step path. We
-            # treat odometry as "the pre-LC trajectory is locally trustworthy"
-            # and re-derive each odometry edge from the current keyframe poses
-            # (T_to_from = T_to_w · inv(T_from_w)). LC edges keep their measured
-            # relative_pose because that is the only signal of accumulated drift.
             if edge.is_loop_closure:
                 rel_4x4 = edge.relative_pose
             else:
@@ -160,22 +152,15 @@ class PoseGraphOptimizer:
                 T_to_w = np.eye(4)
                 T_to_w[:3, :] = kf_map[edge.to_id].pose[:3, :]
                 rel_4x4 = T_to_w @ np.linalg.inv(T_from_w)
-
             rel_t = torch.from_numpy(rel_4x4[:3, :]).unsqueeze(0).double()
             rel_var = th.SE3(tensor=rel_t, name=f"pg_rel_{i}")
-
             pose_from = se3_vars[edge.from_id]
             pose_to = se3_vars[edge.to_id]
-
-            # Loop closures from monocular essential-matrix decomposition have
-            # unit-norm translation (scale ambiguity), so we constrain rotation
-            # only. Odometry edges keep the full 6-DoF residual.
             if edge.is_loop_closure:
                 err_dim = 3
                 err_full = _pose_graph_rot_error
                 err_fixed_from = _pose_graph_rot_error_fixed_from
                 err_fixed_to = _pose_graph_rot_error_fixed_to
-                # Use the rotation block of the information matrix.
                 info_block = edge.information[3:, 3:]
                 info_mean = float(np.trace(info_block) / 3.0)
             else:
@@ -184,14 +169,9 @@ class PoseGraphOptimizer:
                 err_fixed_from = _pose_graph_error_fixed_from
                 err_fixed_to = _pose_graph_error_fixed_to
                 info_mean = float(np.trace(edge.information) / 6.0)
-
-            # ScaleCostWeight multiplies the residual, so the squared cost is
-            # multiplied by scale**2. For a Mahalanobis cost r^T (lambda*I) r
-            # the matching scalar weight is sqrt(lambda).
             edge_weight = th.ScaleCostWeight(
                 torch.tensor(np.sqrt(max(info_mean, 0.0)), dtype=torch.float64)
             )
-
             if edge.from_id == anchor_id:
                 cost = th.AutoDiffCostFunction(
                     optim_vars=[pose_to],
@@ -220,15 +200,12 @@ class PoseGraphOptimizer:
                     name=f"pg_edge_{i}",
                 )
             objective.add(cost)
-
         if objective.size_cost_functions() == 0:
             print("[PG] No valid edges for optimization. Skipping.")
             return
-
         objective.update()
         initial_error = objective.error_metric().sum().item()
         print(f"[PG] Initial error: {initial_error:.4f}")
-
         optimizer = th.LevenbergMarquardt(
             objective,
             max_iterations=cfg.max_iterations,
@@ -240,16 +217,12 @@ class PoseGraphOptimizer:
             vectorize=True,
         )
         info = optimizer.optimize()
-
         final_error = objective.error_metric().sum().item()
         print(f"[PG] Status      : {info.status[0]}")
         print(f"[PG] Iterations  : {info.converged_iter[0].item() + 1}")
-        print(f"[PG] Final error : {final_error:.4f}  (delta {initial_error - final_error:.4f})")
-
-        # Per-keyframe correction transform that takes a world point seen by
-        # the OLD pose to its consistent location under the NEW pose:
-        #     p_new = R_corr @ p_old + t_corr
-        # with R_corr = R_wc_new^T @ R_wc_old and t_corr = R_wc_new^T @ (t_wc_old - t_wc_new).
+        print(
+            f"[PG] Final error : {final_error:.4f}  (delta {initial_error - final_error:.4f})"
+        )
         pose_corrections: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
@@ -259,27 +232,13 @@ class PoseGraphOptimizer:
             new_3x4 = cam_var.tensor.detach().cpu().numpy()[0]
             new_pose = np.eye(4)
             new_pose[:3, :] = new_3x4
-
-            R_old, t_old = old_pose[:3, :3], old_pose[:3, 3]
-            R_new, t_new = new_pose[:3, :3], new_pose[:3, 3]
+            R_old, t_old = (old_pose[:3, :3], old_pose[:3, 3])
+            R_new, t_new = (new_pose[:3, :3], new_pose[:3, 3])
             R_cw_new = R_new.T
             t_cw_new = -R_new.T @ t_new
             R_corr = R_cw_new @ R_old
             t_corr = R_cw_new @ t_old + t_cw_new
             pose_corrections[kf_id] = (R_corr, t_corr)
-
-        # Anchor each 3D point to a SINGLE keyframe (its earliest observer).
-        # Element-wise averaging of rotation matrices across multiple observing
-        # keyframes does not produce a rotation, so it contracts/skews the
-        # point cloud — which then blows up the next BA.
-        #
-        # IMPORTANT: iterate over ALL kf nodes (including the anchor) when
-        # picking each point's earliest observer. Previously this loop only
-        # iterated over `pose_corrections.keys()`, which excludes the anchor;
-        # a point first seen by the anchor and re-observed by, say, kf 5 was
-        # then incorrectly assigned kf 5's correction and dragged off the
-        # anchor's projection — making the post-PGO state inconsistent and
-        # forcing the next GBA's "max_mean_error_per_obs" guard to trip.
         sorted_kf_ids = sorted(kf_map.keys())
         pt_anchor: dict[int, int] = {}
         for kf_id in sorted_kf_ids:
@@ -288,7 +247,6 @@ class PoseGraphOptimizer:
                 pt_id = int(mapper.pointmap.observations[obs_id, 0])
                 if pt_id not in pt_anchor:
                     pt_anchor[pt_id] = kf_id
-
         corrected_pts = 0
         for pt_id, kf_id in pt_anchor.items():
             if kf_id == anchor_id:
@@ -297,7 +255,6 @@ class PoseGraphOptimizer:
             p = mapper.pointmap.points_3d[pt_id]
             mapper.pointmap.points_3d[pt_id] = R_corr @ p + t_corr
             corrected_pts += 1
-
         for kf_id, cam_var in se3_vars.items():
             if kf_id == anchor_id:
                 continue
@@ -306,7 +263,7 @@ class PoseGraphOptimizer:
             new_pose = np.eye(4)
             new_pose[:3, :] = new_3x4
             kf.pose = new_pose
-
-        print(f"[PG] Corrected {corrected_pts} 3D points "
-              f"(single anchor per point, {len(pose_corrections)} keyframes updated)")
+        print(
+            f"[PG] Corrected {corrected_pts} 3D points (single anchor per point, {len(pose_corrections)} keyframes updated)"
+        )
         print(f"[PG] --- Pose Graph Optimization Complete ---\n")

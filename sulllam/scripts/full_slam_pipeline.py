@@ -1,17 +1,14 @@
 from __future__ import annotations
-
 import argparse
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-
 import cv2 as cv
 import numpy as np
 
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-
 from sulllam.mapping.bundle_adjustment.local_bundle_adjustment import (
     LocalBundleAdjustment,
     LocalBundleAdjustmentConfig,
@@ -23,6 +20,7 @@ from sulllam.mapping.bundle_adjustment.global_bundle_adjustment import (
 from sulllam.mapping.loop_closure import LoopClosureConfig, LoopClosureDetector
 from sulllam.mapping.pose_graph import PoseGraphOptimizer, PoseGraphOptimizerConfig
 from sulllam.pipeline import SLAMConfig, SLAMPipeline
+from sulllam.utils.ros import ROSPublisherWrapper
 
 
 def _sorted_images(folder: Path) -> list[Path]:
@@ -39,60 +37,29 @@ def _build_K(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
 
 
 def _build_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Full SLAM pipeline (extraction + matching + local BA + loop closure "
-            "+ pose-graph optimisation + global BA)."
-        )
-    )
-
-    parser.add_argument("--images", type=Path, required=True,
-                        help="Directory containing sequential images")
-    parser.add_argument("--fx", type=float, required=True, help="Focal length x (px)")
-    parser.add_argument("--fy", type=float, required=True, help="Focal length y (px)")
-    parser.add_argument("--cx", type=float, required=True, help="Principal point x (px)")
-    parser.add_argument("--cy", type=float, required=True, help="Principal point y (px)")
-
-    parser.add_argument("--output", type=Path, default=Path("clouds"),
-                        help="Output directory for point clouds and trajectory")
-    parser.add_argument("--skip", type=int, default=1,
-                        help="Process every Nth frame (default: 1, no skipping)")
-    parser.add_argument("--max-frames", type=int, default=None,
-                        help="Stop after this many frames")
-
-    parser.add_argument("--ba-frequency", type=int, default=5,
-                        help="Run local BA every N frames")
-    parser.add_argument("--ba-min-frames", type=int, default=12,
-                        help="Minimum frames before running local BA")
-    parser.add_argument("--gba-min-frames", type=int, default=30,
-                        help="Minimum frames before running global BA")
-
-    parser.add_argument("--lc-frequency", type=int, default=10,
-                        help="Run loop-closure detection every N frames")
-    parser.add_argument("--lc-min-matches", type=int, default=30,
-                        help="Minimum descriptor matches required for a LC candidate")
-    parser.add_argument("--lc-min-frame-gap", type=int, default=20,
-                        help="Minimum frame gap to consider a keyframe pair as LC")
-    parser.add_argument("--lc-min-inlier-ratio", type=float, default=0.3,
-                        help="Minimum essential-matrix inlier ratio for a LC candidate")
-
-    parser.add_argument("--pgo-max-iterations", type=int, default=20,
-                        help="Max LM iterations for pose-graph optimisation")
-
-    parser.add_argument("--use-match-confidence", action="store_true",
-                        help="Enable confidence-weighted residuals in BA")
-    parser.add_argument("--confidence-gamma", type=float, default=1.0,
-                        help="Match confidence exponent")
-    parser.add_argument("--use-adaptive-barron", action="store_true",
-                        help="Enable adaptive Barron loss from entropy in BA")
-    parser.add_argument("--barron-alpha-min", type=float, default=-2.0,
-                        help="Min Barron alpha (dark scenes)")
-    parser.add_argument("--barron-alpha-max", type=float, default=2.0,
-                        help="Max Barron alpha (bright scenes)")
-
-    parser.add_argument("--no-ros", action="store_true",
-                        help="Run without ROS publishing")
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--images", type=Path, required=True)
+    parser.add_argument("--fx", type=float, required=True)
+    parser.add_argument("--fy", type=float, required=True)
+    parser.add_argument("--cx", type=float, required=True)
+    parser.add_argument("--cy", type=float, required=True)
+    parser.add_argument("--output", type=Path, default=Path("clouds"))
+    parser.add_argument("--skip", type=int, default=1)
+    parser.add_argument("--max-frames", type=int, default=None)
+    parser.add_argument("--ba-frequency", type=int, default=5)
+    parser.add_argument("--ba-min-frames", type=int, default=12)
+    parser.add_argument("--gba-min-frames", type=int, default=30)
+    parser.add_argument("--lc-frequency", type=int, default=10)
+    parser.add_argument("--lc-min-matches", type=int, default=30)
+    parser.add_argument("--lc-min-frame-gap", type=int, default=20)
+    parser.add_argument("--lc-min-inlier-ratio", type=float, default=0.3)
+    parser.add_argument("--pgo-max-iterations", type=int, default=20)
+    parser.add_argument("--use-match-confidence", action="store_true")
+    parser.add_argument("--confidence-gamma", type=float, default=1.0)
+    parser.add_argument("--use-adaptive-barron", action="store_true")
+    parser.add_argument("--barron-alpha-min", type=float, default=-2.0)
+    parser.add_argument("--barron-alpha-max", type=float, default=2.0)
+    parser.add_argument("--no-ros", action="store_true")
     return parser.parse_args()
 
 
@@ -121,10 +88,7 @@ def _build_config(args: argparse.Namespace, K: np.ndarray) -> SLAMConfig:
         min_frame_gap=args.lc_min_frame_gap,
         min_inlier_ratio=args.lc_min_inlier_ratio,
     )
-    pgo_cfg = PoseGraphOptimizerConfig(
-        max_iterations=args.pgo_max_iterations,
-    )
-
+    pgo_cfg = PoseGraphOptimizerConfig(max_iterations=args.pgo_max_iterations)
     return SLAMConfig(
         K=K,
         bundle_adjustment=LocalBundleAdjustment(ba_cfg),
@@ -141,7 +105,6 @@ def _build_config(args: argparse.Namespace, K: np.ndarray) -> SLAMConfig:
 
 def main() -> None:
     args = _build_args()
-
     image_paths = _sorted_images(args.images)
     if args.skip > 1:
         image_paths = image_paths[:: args.skip]
@@ -149,42 +112,31 @@ def main() -> None:
     if args.max_frames:
         image_paths = image_paths[: args.max_frames]
     print(f"[SLAM] Loaded {len(image_paths)} image paths")
-
     images = _load_images(image_paths)
     if len(images) < 2:
         sys.exit("[SLAM] Need at least 2 readable images to run.")
     print(f"[SLAM] Loaded {len(images)} valid images")
-
     K = _build_K(args.fx, args.fy, args.cx, args.cy)
     config = _build_config(args, K)
-
     ros_publisher = None
     if not args.no_ros:
-        try:
-            from sulllam.utils.ros import ROSPublisherWrapper
-            ros_publisher = ROSPublisherWrapper()
-            print("[ROS] Publisher initialised — streaming to ROS 2 topics")
-        except Exception as exc:
-            print(f"[WARN] Could not initialise ROS publisher ({exc}). "
-                  "Running without ROS. Use --no-ros to suppress this warning.")
-
+        ros_publisher = ROSPublisherWrapper()
+        print("[ROS] Publisher initialised — streaming to ROS 2 topics")
     pipeline = SLAMPipeline(config)
-
     try:
         trajectory = pipeline.run(images, ros_publisher=ros_publisher)
     finally:
         if ros_publisher is not None:
             ros_publisher.shutdown()
-
     print(f"\n[SLAM] Pipeline complete")
     print(f"[SLAM] Total frames    : {len(images)}")
     print(f"[SLAM] Keyframes       : {len(pipeline.mapper.keyframes)}")
     print(f"[SLAM] 3D points       : {pipeline.mapper.pointmap.num_points}")
     print(f"[SLAM] Observations    : {pipeline.mapper.pointmap.num_observations}")
-    print(f"[SLAM] Pose-graph edges: {len(pipeline.pose_graph.edges)} "
-          f"({len(pipeline.pose_graph.loop_closure_edges)} loop closures)")
+    print(
+        f"[SLAM] Pose-graph edges: {len(pipeline.pose_graph.edges)} ({len(pipeline.pose_graph.loop_closure_edges)} loop closures)"
+    )
     print(f"[SLAM] Point clouds saved to: {args.output}")
-
     args.output.mkdir(parents=True, exist_ok=True)
     trajectory_file = args.output / "trajectory.npy"
     np.save(trajectory_file, trajectory)
