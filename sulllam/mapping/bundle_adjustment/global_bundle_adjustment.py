@@ -22,6 +22,7 @@ class GlobalBundleAdjustmentConfig:
     rel_err_tolerance: float = 1e-4
     max_observations: int = 50_000
     max_mean_error_per_obs: float = 50.0
+    num_fixed_poses: int = 1  # number of oldest keyframes to fix for gauge freedom
 
 
 class GlobalBundleAdjustment(BaseBundleAdjustment):
@@ -79,8 +80,9 @@ class GlobalBundleAdjustment(BaseBundleAdjustment):
             t = torch.from_numpy(mapper.pointmap.points_3d[pt_id]).unsqueeze(0).double()
             pt_vars[pt_id] = th.Point3(tensor=t, name=f"gba_pt_{pt_id}")
 
-        anchor_id = mapper.keyframes[0].idx
-        print(f"[GBA] Anchored keyframe: {anchor_id}")
+        n_fixed = max(1, cfg.num_fixed_poses)
+        fixed_ids = {kf.idx for kf in mapper.keyframes[:n_fixed]}
+        print(f"[GBA] Fixed keyframes ({n_fixed}): {sorted(fixed_ids)}")
 
         fixed_edges = opt_edges = 0
         for o in ba_obs:
@@ -94,7 +96,7 @@ class GlobalBundleAdjustment(BaseBundleAdjustment):
             cam_var = se3_vars[kf_id]
             pt_var = pt_vars[pt_id]
 
-            if kf_id == anchor_id:
+            if kf_id in fixed_ids:
                 cost_fn = th.AutoDiffCostFunction(
                     optim_vars=[pt_var],
                     err_fn=_reproj_error_fixed_cam,
@@ -157,7 +159,7 @@ class GlobalBundleAdjustment(BaseBundleAdjustment):
             return
 
         for kf_id, cam_var in se3_vars.items():
-            if kf_id == anchor_id:
+            if kf_id in fixed_ids:
                 continue
             kf = next(k for k in mapper.keyframes if k.idx == kf_id)
             pose_4x4 = np.eye(4)

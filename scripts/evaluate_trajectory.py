@@ -36,6 +36,7 @@ from sulllam.mapping.loop_closure import LoopClosureConfig, LoopClosureDetector
 from sulllam.mapping.pose_graph import PoseGraphOptimizer, PoseGraphOptimizerConfig
 from sulllam.pipeline import SLAMConfig, SLAMPipeline
 
+from sulllam.segmentation import SAMSegmentor, COCO_DYNAMIC_CLASSES
 
 # ---------------------------------------------------------------------------
 # COLMAP I/O
@@ -185,14 +186,19 @@ def _build_config(args: argparse.Namespace, K: np.ndarray) -> SLAMConfig:
     return SLAMConfig(
         K=K,
         bundle_adjustment=LocalBundleAdjustment(
-            LocalBundleAdjustmentConfig(window_size=10, max_iterations=20, huber_radius=1.0)
+            LocalBundleAdjustmentConfig(window_size=10, max_iterations=50, huber_radius=0.8)
+        ),
+        segmentor=SAMSegmentor(
+            sam2_checkpoint="checkpoints/sam2_hiera_tiny.pt",
+            sam2_model_cfg="sam2_hiera_t.yaml",
+            device="cuda",
+            class_ids=COCO_DYNAMIC_CLASSES
         ),
         max_reproj_error=2.0,
         max_depth=50.0,
-        max_points=200,
+        max_points=100,
         ba_frequency=5,
         ba_min_frames=15,
-        clouds_dir=args.clouds_dir,
     )
 
 
@@ -238,6 +244,10 @@ def main() -> None:
         image_paths = image_paths[: args.max_frames]
 
     images, valid_paths = _load_images(image_paths)
+
+    images = images[::15]
+    valid_paths = valid_paths[::15]
+
     print(f"[SLAM] {len(images)} images loaded")
     if len(images) < 2:
         sys.exit("[SLAM] Need at least 2 readable images.")

@@ -325,16 +325,16 @@ class SLAMPipeline:
         if n_kfs % cfg.ba_frequency == 0 and n_kfs >= cfg.ba_min_frames:
             cfg.bundle_adjustment.run(self.mapper, cfg.K)
 
-        loop_closed = False
-        if n_kfs % cfg.lc_frequency == 0:
-            lc_candidates = cfg.loop_closure_detector.detect(curr_kf, self.mapper, cfg.K)
-            for lc in lc_candidates:
-                self.pose_graph.add_loop_closure_edge(
-                    from_id=lc["match_kf"].idx,
-                    to_id=lc["query_kf"].idx,
-                    relative_pose=lc["relative_pose"],
-                )
-                loop_closed = True
+        # loop_closed = False
+        # if n_kfs % cfg.lc_frequency == 0:
+        #     lc_candidates = cfg.loop_closure_detector.detect(curr_kf, self.mapper, cfg.K)
+        #     for lc in lc_candidates:
+        #         self.pose_graph.add_loop_closure_edge(
+        #             from_id=lc["match_kf"].idx,
+        #             to_id=lc["query_kf"].idx,
+        #             relative_pose=lc["relative_pose"],
+        #         )
+        #         loop_closed = True
 
         # Throttle PGO/GBA: even if the LC detector keeps firing on the same
         # revisit, don't re-run PGO unless enough new keyframes have been added
@@ -346,7 +346,7 @@ class SLAMPipeline:
         #     cfg.pose_graph_optimizer.optimize(self.mapper, self.pose_graph)
         #     self._last_pgo_kf = i
 
-        # if run_pgo and i >= cfg.gba_min_frames:
+        # if i % 50 == 0:
         #     cfg.global_bundle_adjustment.run(self.mapper, cfg.K)
 
         # Sync from mapper in case BA updated poses.

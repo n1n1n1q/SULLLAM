@@ -10,8 +10,8 @@ from sulllam.segmentation import SAMSegmentor, COCO_DYNAMIC_CLASSES
 
 
 K = np.array([
-    [1638.35,    0.0,  960.0],
-    [   0.0, 1575.81,  540.0],
+    [1013.535131,    0.0,  638.295572],
+    [   0.0,   1060.724658,  399.313666],
     [   0.0,    0.0,    1.0]
 ])
 
